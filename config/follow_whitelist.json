@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "enabled": true,
+  "require_playing": true,
+  "on_unknown_app": "deny",
+  "on_missing_file": "builtin_default",
+  "on_broken_file": "deny_all_with_error",
+
+  "apps": [
+    { "match": "exact", "pattern": "汽水音乐", "label": "汽水音乐" },
+    { "match": "exact", "pattern": "cloudmusic.exe", "label": "网易云音乐（实测 app_id）" }
+  ],
+
+  "deny": [
+    { "match": "regex", "pattern": "^mpvnet\\.exe$", "label": "用户日常 mpv.net（铁律1禁碰）" },
+    { "match": "regex", "pattern": "^msedgewebview2\\.exe$", "label": "WebView2 宿主（实测：红果短剧）" },
+    { "match": "regex", "pattern": "^(chrome|msedge|firefox)\\.exe$", "label": "浏览器" }
+  ]
+}

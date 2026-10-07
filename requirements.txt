@@ -1,0 +1,16 @@
+# Runtime dependencies for mvm (music video matcher).
+#
+# Deliberately minimal: everything except numpy is Python standard library.
+#
+# What each piece needs:
+#   numpy    -- cross-correlation for alignment, FFT, sample handling
+#
+# NOT listed, because they are not Python packages:
+#   mpv      -- the video window            (set MVM_MPV, or put it on PATH)
+#   ffmpeg   -- audio extraction/capture    (set MVM_FFMPEG, or put it on PATH)
+#   yt-dlp   -- stream URL resolution       (vendor/ module or bin/yt-dlp.exe)
+#
+# The WASAPI loopback capture is done through ctypes/COM directly, so no audio
+# library (sounddevice, pyaudio, ...) is required -- and none is imported.
+
+numpy>=1.24

@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Credentials -- never commit these.
+#
+# state/cookies.txt holds a logged-in bilibili session. Once pushed it cannot be
+# removed by deleting the file: it stays in the git history and must be treated
+# as leaked (the account session has to be invalidated).
+# ---------------------------------------------------------------------------
+state/cookies.txt
+state/.cookie-jar/
+state/browser-profile*/
+config/cookies.txt
+*cookies*.txt
+*.cookies.txt
+
+# ---------------------------------------------------------------------------
+# Bundled runtimes -- large binaries, and not ours to redistribute here.
+#   bin/     mpv + yt-dlp copies (hundreds of MB)
+#   vendor/  yt-dlp source
+# Install these locally instead (see README).
+# ---------------------------------------------------------------------------
+bin/
+vendor/
+*.exe
+*.dll
+*.pyd
+
+# ---------------------------------------------------------------------------
+# Runtime state, logs, caches
+# ---------------------------------------------------------------------------
+logs/
+state/_mvm_cmd.txt
+state/_mvm_status.txt
+state/.follow.lock
+state/vocadb_cache/
+state/_align_work/
+state/_selftest_align/
+state/_tmp/
+state/delay_history.json
+
+# ---------------------------------------------------------------------------
+# Test media produced locally (regenerable with ffmpeg)
+# ---------------------------------------------------------------------------
+state/_*.wav
+state/_*.mp4
+state/_*.mp3
+
+# ---------------------------------------------------------------------------
+# Python / OS / editor
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+NUL
