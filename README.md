@@ -1,7 +1,17 @@
+<div align="center">
+
+<img src="assets/icon-256.png" width="160" alt="mvm icon — a girl peeking over a play button labelled mvm">
+
 # mvm — music video matcher
 
-Find the **matching music video** for whatever song is playing, and show it in
-sync — without touching your audio.
+**Find the matching music video for whatever song is playing, and show it in
+sync — without touching your audio.**
+
+[Quick start](QUICKSTART.md) · [How it works](#how-it-works) · [Limitations](#honest-limitations)
+
+</div>
+
+---
 
 You keep listening in your normal player (NetEase Cloud Music, 汽水音乐, …).
 `mvm` reads what is playing from Windows' system media controls, finds the
