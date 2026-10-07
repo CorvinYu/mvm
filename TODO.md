@@ -1,13 +1,13 @@
-# TODO — music-video-matcher
+# TODO — mvm (music video matcher)
 
-> 来源：用户直接记录（`todo.draft.md`）+ 实施中发现的待办。
-> 状态：`[ ]` 待做 ｜ `[~]` 进行中 ｜ `[x]` 完成
+> Planned features and known limitations, roughly in priority order.
+> Status: `[ ]` todo ｜ `[~]` in progress ｜ `[x]` done
 
 ---
 
-## A. 用户提出的功能需求（来自 todo.draft.md）
+## A. Feature requests
 
-### [ ] A1. 多源时间轴进度条
+### [ ] A1. Multi-source timeline view
 
 > 能显示一个进度条，包括全程，然后有很多层，每一层是一个源，对齐后可以看到长短，
 > 能够区分出哪些源时间不同，哪些地方有哪些地方没有。
