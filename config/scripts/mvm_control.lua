@@ -114,6 +114,16 @@ end
 --   3. path
 --   4. geometry  (WxH+X+Y)
 --   5. manual_offset  (task-2: cumulative user-preference offset, seconds)
+--   6. fullscreen      (yes/no)   -- issue #2: user asked for fullscreen
+--   7. window-maximized (yes/no)  -- issue #2: user maximized
+--
+-- WHY 6 and 7 EXIST (issue #2, measured 2026-10-08)
+--   The geometry guard could not tell "the user pressed F / maximized" from
+--   "mpv enlarged the window by itself": both look like one big rectangle. So
+--   it treated a deliberate fullscreen as pollution and yanked the window back
+--   -- the user's "无法全屏" report. mpv KNOWS which it is, and these two
+--   properties are that answer. Appended (not inserted) so existing
+--   index-based readers of lines 1-5 keep working with an older file.
 --
 -- IMPORTANT about the geometry: `width`/`height` are the VIDEO's dimensions
 -- (e.g. 1920x1078), NOT the window's. Reporting those and feeding them back
@@ -189,12 +199,18 @@ local function write_status()
 
     local f = io.open(status_file, "w")
     if f then
-        f:write(string.format("%s\n%s\n%s\n%s\n%.3f\n",
+        -- Lines 6-7 let the geometry guard honour a DELIBERATE fullscreen /
+        -- maximize instead of undoing it (issue #2).
+        local fullscreen = mp.get_property("fullscreen") or "no"
+        local maximized = mp.get_property("window-maximized") or "no"
+        f:write(string.format("%s\n%s\n%s\n%s\n%.3f\n%s\n%s\n",
             pos and string.format("%.3f", pos) or "",
             paused or "",
             path or "",
             geom,
-            manual_offset))
+            manual_offset,
+            fullscreen,
+            maximized))
         f:close()
     end
 end

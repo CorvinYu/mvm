@@ -948,6 +948,46 @@ def test_crash_observability() -> None:
           'env["MVM_PARENT_PID"]' in player_src)
 
 
+def test_window_mode_contract() -> None:
+    """21. 全屏/最大化必须被尊重（issue #2）。
+
+    The behavioural proof lives in `src/test_window_guard.py` (13 unit criteria,
+    with `--old` failing exactly the 3 bug cases) and `src/probe_fullscreen_live.py`
+    (6 assertions against a real mpv). This section is the cheap always-on gate
+    so a later edit cannot quietly drop the wiring.
+    """
+    print("\n=== 21. 全屏/最大化被尊重（issue #2）===")
+    lua = (ROOT / "config" / "scripts" / "mvm_control.lua").read_text(encoding="utf-8")
+    check("lua 上报 fullscreen 属性", 'mp.get_property("fullscreen")' in lua)
+    check("lua 上报 window-maximized 属性",
+          'mp.get_property("window-maximized")' in lua)
+    check("状态文件扩展为 7 行（6=fullscreen, 7=maximized）",
+          lua.count("%s\\n") >= 6, f"format has {lua.count('%s\\n')} %s\\n")
+
+    try:
+        import player as _player
+    except Exception as exc:  # noqa: BLE001
+        check("player 可导入", False, f"{type(exc).__name__}: {exc}")
+        return
+    check("player.read_window_mode() 存在",
+          callable(getattr(_player, "read_window_mode", None)))
+    check("player._looks_like_mpv_self_resize() 存在",
+          callable(getattr(_player, "_looks_like_mpv_self_resize", None)))
+    check("近全屏阈值只有一个来源（判据不会漂移）",
+          "NEAR_FULLSCREEN_WORK_AREA_FRACTION" in
+          (ROOT / "src" / "player.py").read_text(encoding="utf-8"))
+
+    p_src = (ROOT / "src" / "player.py").read_text(encoding="utf-8")
+    check("守卫在全屏/最大化时让开",
+          "if fullscreen or maximized:" in p_src)
+    check("remember_geometry 拒绝持久化全屏矩形",
+          "if fullscreen or maximized:\n            return self._geometry" in p_src)
+    check("越界几何仍被拉回（保护未被拿掉）",
+          "elif not rect_on_screen(rect):" in p_src)
+    check("mpv 自放大签名仍被拉回（保护未被拿掉）",
+          "elif _looks_like_mpv_self_resize(rect):" in p_src)
+
+
 def main() -> int:
     print("music-video-matcher 自检")
     print("=" * 60)
@@ -971,6 +1011,7 @@ def main() -> int:
     test_pending_offset_channel()
     test_lua_control_contract()
     test_crash_observability()
+    test_window_mode_contract()
 
     print("\n" + "=" * 60)
     total = _passed + _failed

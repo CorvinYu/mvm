@@ -295,6 +295,56 @@ def default_window_rect() -> tuple[int, int, int, int]:
             wy + wh - h - WINDOW_MARGIN, w, h)
 
 
+# Fraction of the work area above which an on-screen rectangle is treated as
+# mpv self-enlarging rather than a user drag. Shared by
+# `_is_plausible_user_resize` (which refuses to PERSIST such a rect) and
+# `_looks_like_mpv_self_resize` (which decides whether to UNDO it) so the two
+# can never drift apart (issue #2).
+NEAR_FULLSCREEN_WORK_AREA_FRACTION = 0.70
+
+
+def read_window_mode() -> tuple[bool, bool]:
+    """mpv's own (fullscreen, maximized) state, from STATUS_FILE lines 6-7.
+
+    WHY THIS EXISTS (issue #2, measured 2026-10-08)
+        The geometry guard cannot distinguish "the user pressed F" from "mpv
+        enlarged itself": both are one big rectangle. It therefore undid a
+        deliberate fullscreen -- the user's "无法全屏" report. mpv knows the
+        difference; `mvm_control.lua` now publishes it and this reads it.
+
+    Returns (False, False) whenever the answer is unavailable: an older control
+    script, a torn/truncated file, or an mpv we did not start. Reporting False
+    keeps the guard ACTIVE, which is the conservative direction -- a missing
+    flag must not silently disable window management.
+
+    No staleness check is needed: `start()` unlinks STATUS_FILE before spawning,
+    so a value read here always belongs to the mpv this controller launched.
+    """
+    try:
+        lines = STATUS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return (False, False)
+
+    def _yes(index: int) -> bool:
+        return index < len(lines) and lines[index].strip().lower() == "yes"
+
+    return (_yes(5), _yes(6))
+
+
+def _looks_like_mpv_self_resize(rect: tuple[int, int, int, int]) -> bool:
+    """Whether an on-screen change carries mpv's self-enlargement signature.
+
+    Used only AFTER mpv has told us it is neither fullscreen nor maximized (see
+    `read_window_mode`): at that point a near-fullscreen rectangle is mpv having
+    grown itself, which is worth undoing (the "窗口变得很大/挡住屏幕" bug).
+    """
+    _x, _y, w, h = rect
+    wx, wy, ww, wh = work_area()
+    if w <= 0 or h <= 0 or ww <= 0 or wh <= 0:
+        return False
+    return float(w * h) > NEAR_FULLSCREEN_WORK_AREA_FRACTION * float(ww * wh)
+
+
 def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
                               rect: tuple[int, int, int, int]) -> bool:
     """Whether a changed rectangle is plausibly the USER's doing.
@@ -330,7 +380,7 @@ def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
     wx, wy, ww, wh = work_area()
     work_area_px = float(ww * wh) or 1.0
     area = float(w * h)
-    if area > 0.70 * work_area_px:
+    if area > NEAR_FULLSCREEN_WORK_AREA_FRACTION * work_area_px:
         return False                      # near-fullscreen: mpv's own doing
     if area > 1.5 * float(pw * ph):
         return False                      # sudden big growth: not a drag
@@ -813,7 +863,18 @@ class MpvController:
         save_window_state(rect, frame)
 
     def remember_geometry(self) -> tuple[int, int, int, int] | None:
-        """Cache the window rectangle so later songs reuse it (and persist it)."""
+        """Cache the window rectangle so later songs reuse it (and persist it).
+
+        Refuses to record anything while mpv is fullscreen or maximized
+        (issue #2): that rectangle is the SCREEN, not a size the user chose for
+        the window, and persisting it would make every subsequent launch open
+        fullscreen with no way for the guard to tell "user wants this" from
+        "we saved it by accident". The previously pinned rect is kept instead,
+        which is also exactly what mpv restores on leaving fullscreen.
+        """
+        fullscreen, maximized = read_window_mode()
+        if fullscreen or maximized:
+            return self._geometry
         rect = self.get_window_rect()
         if rect:
             self._remember_geometry(rect)
@@ -1071,11 +1132,15 @@ class MpvController:
         with self._lifecycle_lock:
             # Last chance to save where the user left the window: the guard
             # samples every 0.5s, so a move followed immediately by a shutdown
-            # would otherwise be lost.
+            # would otherwise be lost. Skipped while fullscreen/maximized
+            # (issue #2) -- quitting in fullscreen must not persist the screen
+            # rectangle as the window's remembered size.
             try:
-                rect = self.get_window_rect()
-                if rect and rect != self._geometry and rect_on_screen(rect):
-                    self._remember_geometry(rect, measurable=False)
+                fullscreen, maximized = read_window_mode()
+                if not (fullscreen or maximized):
+                    rect = self.get_window_rect()
+                    if rect and rect != self._geometry and rect_on_screen(rect):
+                        self._remember_geometry(rect, measurable=False)
             except OSError:
                 pass
             if self.proc and self.proc.poll() is None:
@@ -1473,6 +1538,17 @@ class MpvController:
             if rect is None:
                 time.sleep(interval)
                 continue
+            # A DELIBERATE fullscreen / maximize (issue #2): leave the window
+            # exactly as the user asked for it. We do NOT enforce, and we do NOT
+            # persist this rectangle -- it describes a MODE, not the window size
+            # the user chose, so saving it would make every later launch open
+            # fullscreen (the same class of pollution as the giant-window bug).
+            # mpv restores the previous rectangle when the mode ends, after which
+            # this guard resumes on the pinned rect.
+            fullscreen, maximized = read_window_mode()
+            if fullscreen or maximized:
+                time.sleep(interval)
+                continue
             with self._geometry_lock:
                 enforce = time.time() < self._enforce_until
                 pinned = self._geometry
@@ -1481,19 +1557,33 @@ class MpvController:
                 self._remember_geometry(rect)
             elif rect != pinned:
                 if enforce:
+                    # Just after a launch/loadfile mpv re-centres itself, so a
+                    # moved window here is mpv's doing and must be undone.
                     x, y, w, h = pinned
                     self.set_window_rect(x, y, w, h)
-                elif (rect_on_screen(rect)
-                      and _is_plausible_user_resize(pinned, rect)
-                      and self._within_cumulative_growth(rect)):
+                elif not rect_on_screen(rect):
+                    # Runaway geometry, off-screen (measured: 3181,1377 /
+                    # 3285,1428). It would be lost to the user, so undo it.
+                    x, y, w, h = pinned
+                    self.set_window_rect(x, y, w, h)
+                elif ( _is_plausible_user_resize(pinned, rect)
+                       and self._within_cumulative_growth(rect)):
                     # User moved/resized it somewhere sane: adopt + persist.
                     self._remember_geometry(rect, measurable=False)
-                else:
-                    # Runaway geometry (mpv has been seen at 3181,1377 /
-                    # 3285,1428, off-screen) OR mpv resized itself to fill the
-                    # screen. Snap back rather than save it.
+                elif _looks_like_mpv_self_resize(rect):
+                    # mpv grew itself to fill the screen WITHOUT fullscreen being
+                    # on, which is the pollution this guard exists for. Undo it.
                     x, y, w, h = pinned
                     self.set_window_rect(x, y, w, h)
+                else:
+                    # On-screen, not mpv's self-enlargement signature, but past
+                    # our conservative "plausible drag" heuristics -- e.g. the
+                    # user deliberately made the window much bigger at once.
+                    # LEAVE THE WINDOW ALONE (issue #2: the old code yanked it
+                    # back, which the user experienced as "无法调整位置") and
+                    # merely decline to remember it, so nothing gets persisted
+                    # from a resize we are not confident about.
+                    pass
             time.sleep(interval)
 
     def _within_cumulative_growth(self, rect: tuple[int, int, int, int]) -> bool:
