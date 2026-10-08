@@ -225,12 +225,49 @@ SCRATCH.mkdir(parents=True, exist_ok=True)
 short = SCRATCH / "_mvm_status.txt"
 short.write_text("12.5\nno\nC:/x.mp4\nhas-window\n0.000\n", encoding="utf-8")
 player.STATUS_FILE = short
-check("只有 5 行时 read_window_mode 返回 (False, False)（守卫保持启用）",
+player.reset_window_mode_cache()
+check("只有 5 行且无历史值时 read_window_mode 返回 (False, False)（守卫保持启用）",
       player.read_window_mode() == (False, False),
       f"{player.read_window_mode()}")
 missing = SCRATCH / "_does_not_exist.txt"
 player.STATUS_FILE = missing
-check("状态文件缺失时返回 (False, False)", player.read_window_mode() == (False, False))
+check("状态文件缺失且无历史值时返回 (False, False)",
+      player.read_window_mode() == (False, False))
+
+# --------------------------------------------------------------------------
+print("\n§5 截断写竞态：读到半截文件必须回退到上次已知值")
+# --------------------------------------------------------------------------
+# WHY THIS CASE EXISTS (measured 2026-10-08): mvm_control.lua rewrites the
+# status file with a plain truncating write every 0.5s, so a reader can catch it
+# EMPTY or PARTIAL. Running the live fullscreen probe three times, the third run
+# had its window yanked OUT of fullscreen again: on one tick the guard read a
+# truncated file, concluded "not fullscreen", and its ENFORCE branch (active for
+# ~12s after a launch) snapped the window back. Caching the last good reading
+# fixes it -- and this case must FAIL if that cache is removed.
+good = _status({"fullscreen": "yes", "maximized": "no"})
+player.reset_window_mode_cache()
+check("完整文件被正确解析为 (True, False)", player.read_window_mode() == (True, False),
+      f"{player.read_window_mode()}")
+
+good.write_text("", encoding="utf-8")          # caught mid-truncate
+check("文件被截断为空时回退到上次已知值 (True, False)（否则全屏会被拉回）",
+      player.read_window_mode() == (True, False),
+      f"{player.read_window_mode()}")
+
+good.write_text("12.5\nno\n", encoding="utf-8")  # partial write
+check("文件只写了一半时仍回退到上次已知值",
+      player.read_window_mode() == (True, False),
+      f"{player.read_window_mode()}")
+
+player.STATUS_FILE = SCRATCH / "_nope.txt"
+check("文件消失时仍回退到上次已知值",
+      player.read_window_mode() == (True, False),
+      f"{player.read_window_mode()}")
+
+player.reset_window_mode_cache()
+check("reset_window_mode_cache() 后不再回退（新进程不继承旧模式）",
+      player.read_window_mode() == (False, False),
+      f"{player.read_window_mode()}")
 
 # --------------------------------------------------------------------------
 passed = sum(1 for ok, _, _ in _results if ok)

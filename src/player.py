@@ -312,23 +312,50 @@ def read_window_mode() -> tuple[bool, bool]:
         deliberate fullscreen -- the user's "无法全屏" report. mpv knows the
         difference; `mvm_control.lua` now publishes it and this reads it.
 
-    Returns (False, False) whenever the answer is unavailable: an older control
-    script, a torn/truncated file, or an mpv we did not start. Reporting False
-    keeps the guard ACTIVE, which is the conservative direction -- a missing
-    flag must not silently disable window management.
+    THE TRUNCATE-WRITE RACE, AND WHY THE LAST KNOWN VALUE IS CACHED ★
+        Lua rewrites this file every 0.5s with a plain truncating write, so a
+        reader can observe it EMPTY or PARTIAL (documented in NOTES §3.2 #2 for
+        the same file). Measured 2026-10-08 while running the fullscreen probe
+        three times: the third run's window was yanked out of fullscreen again,
+        because on one tick this function saw a truncated file, reported "not
+        fullscreen", and the guard's ENFORCE branch (still active for ~12s after
+        a launch) snapped the window back.
 
-    No staleness check is needed: `start()` unlinks STATUS_FILE before spawning,
-    so a value read here always belongs to the mpv this controller launched.
+        A truncation is momentary, so the most recent GOOD reading is the best
+        estimate of the truth. Falling back to it makes the guard's fullscreen
+        bypass robust; with no previous reading at all we return (False, False),
+        which keeps the guard ACTIVE -- the conservative direction, since a
+        missing flag must not silently disable window management.
     """
+    global _last_window_mode
     try:
         lines = STATUS_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return (False, False)
+        return _last_window_mode or (False, False)
 
-    def _yes(index: int) -> bool:
-        return index < len(lines) and lines[index].strip().lower() == "yes"
+    # Lines 1-7 must all be present; a short file means we caught the writer
+    # mid-truncate, not that the mode is false.
+    if len(lines) < 7:
+        return _last_window_mode or (False, False)
 
-    return (_yes(5), _yes(6))
+    mode = (lines[5].strip().lower() == "yes", lines[6].strip().lower() == "yes")
+    _last_window_mode = mode
+    return mode
+
+
+# Most recent successfully parsed (fullscreen, maximized). See read_window_mode.
+_last_window_mode: tuple[bool, bool] | None = None
+
+
+def reset_window_mode_cache() -> None:
+    """Forget the cached mode. Called when a new mpv is spawned.
+
+    Without this, the first ticks of a NEW mpv (before it writes its own status
+    file) would inherit the PREVIOUS process's mode -- e.g. a fresh window would
+    be treated as fullscreen because the last one quit in fullscreen.
+    """
+    global _last_window_mode
+    _last_window_mode = None
 
 
 def _looks_like_mpv_self_resize(rect: tuple[int, int, int, int]) -> bool:
@@ -1003,6 +1030,10 @@ class MpvController:
         with self._lifecycle_lock:
             if self.running:
                 return True
+            # A new process must not inherit the previous one's window mode from
+            # the cache (e.g. a window opening as "fullscreen" because the last
+            # mpv quit while fullscreen).
+            reset_window_mode_cache()
 
             # Make sure the PREVIOUS process is really gone before spawning a
             # new one. WHY (measured 2026-10-08: the user saw TWO windows while

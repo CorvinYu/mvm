@@ -54,8 +54,32 @@ def main() -> int:
             return 1
         print(f"  mpv pid={ctl.pid}, pinned={ctl._geometry}")
 
-        normal = ctl.get_window_rect()
-        print(f"  初始窗口矩形: {normal}")
+        # WAIT FOR A LAID-OUT WINDOW before taking the baseline.
+        #
+        # WHY (measured 2026-10-08): reading the rect the instant start() returns
+        # can yield an initialising artefact -- observed (208,208,136,100). Using
+        # that as "the normal window" made the exit-fullscreen assertion compare
+        # against a bogus size and fail, and because it is a TIMING artefact the
+        # probe passed or failed at random. The product itself has the same
+        # guard for the same reason (`MIN_WINDOW_SIZE_PX = (320, 240)`), so the
+        # probe uses that threshold too. The baseline is the controller's own
+        # `_geometry` -- what it believes the pinned rect to be -- not a fresh
+        # measurement.
+        deadline = time.time() + 25
+        normal = None
+        while time.time() < deadline:
+            r = ctl.get_window_rect()
+            if r and r[2] >= 320 and r[3] >= 240:
+                normal = r
+                break
+            time.sleep(0.5)
+        if normal is None:
+            check("窗口完成布局（拿到可信基线）", False,
+                  f"rect={ctl.get_window_rect()}")
+            return 1
+        check("窗口完成布局（拿到可信基线）", True, f"normal={normal}")
+        pinned_before = ctl._geometry
+        print(f"  基线：实测 {normal}，控制器 _geometry {pinned_before}")
 
         # --- enter fullscreen over the real command channel -----------------
         print("\n§1 通过真实命令通道进入全屏")
@@ -84,8 +108,8 @@ def main() -> int:
         check("全屏后窗口仍覆盖屏幕（守卫没有拉回）", grew,
               f"last={last} work_area={ww}x{wh}")
         check("全屏矩形没有被写进 self._geometry",
-              ctl._geometry == normal,
-              f"pinned={ctl._geometry} normal={normal}")
+              ctl._geometry == pinned_before,
+              f"pinned={ctl._geometry} pinned_before={pinned_before}")
 
         # --- leaving fullscreen restores the pinned rect -------------------
         print("\n§3 退出全屏应恢复到全屏前的尺寸")
@@ -96,9 +120,9 @@ def main() -> int:
               (fs2, maxed2) == (False, False), f"{fs2, maxed2}")
         rest = ctl.get_window_rect()
         check("窗口恢复到全屏前的尺寸附近",
-              rest is not None and abs(rest[2] - normal[2]) <= 40
-              and abs(rest[3] - normal[3]) <= 40,
-              f"restored={rest} normal={normal}")
+              rest is not None and abs(rest[2] - pinned_before[2]) <= 40
+              and abs(rest[3] - pinned_before[3]) <= 40,
+              f"restored={rest} pinned_before={pinned_before}")
 
     finally:
         try:
