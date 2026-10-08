@@ -13,11 +13,54 @@
 --   So we poll a plain command file instead. It needs no pipes and no sockets.
 
 local cmd_file = os.getenv("MVM_CMD_FILE") or "mvm_cmd.txt"
+-- Who owns this mpv (issue #6): the Python follower. If it dies for ANY reason
+-- (crash, hard kill, sandbox teardown), the Lua timer below notices and quits,
+-- so an orphan window cannot outlive its daemon. Only active when the variable
+-- is present and parses as a number; standalone/test mpv runs skip the check.
+local parent_pid = tonumber(os.getenv("MVM_PARENT_PID") or "")
 
 -- mp.log requires a level string first, then the message. Calling it with a
 -- single argument raises "Invalid log level ..." and kills the script.
 local function log(msg)
     mp.log("info", "mvm: " .. msg)
+end
+
+local function parent_is_alive()
+    -- Liveness check that survives a killed-but-not-yet-reaped process.
+    --
+    -- WHY NOT OpenProcess alone (measured 2026-10-08): OpenProcess keeps
+    -- SUCCEEDING after TerminateProcess while any handle to the process object
+    -- remains open -- e.g. the parent Python still holds the Popen object. The
+    -- pid is not reused and the process object lingers, so "can I open it?"
+    -- answers "yes" for a process that is already dead. That made the orphan
+    -- guard silently useless in the exact case it exists for (an e2e test that
+    -- hard-killed the daemon left the mpv running for 20s+).
+    --
+    -- GetExitCodeProcess is the correct primitive: a terminated process
+    -- reports its exit code instead of STILL_ACTIVE (259).
+    local ok, ffi = pcall(require, "ffi")
+    if not ok then return true end  -- no ffi: assume alive (never self-kill)
+    ffi.cdef[[
+        typedef void* HANDLE;
+        HANDLE __stdcall OpenProcess(unsigned long, int, unsigned long);
+        int __stdcall CloseHandle(HANDLE);
+        int __stdcall GetExitCodeProcess(HANDLE, unsigned long*);
+    ]]
+    local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    local STILL_ACTIVE = 259
+    local h = ffi.C.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid)
+    if h == nil then
+        return false           -- no such process at all
+    end
+    local code = ffi.new("unsigned long[1]", 0)
+    local okq = ffi.C.GetExitCodeProcess(h, code)
+    ffi.C.CloseHandle(h)
+    if okq == 0 then
+        -- Could not query (rights). Be conservative: treat as alive rather
+        -- than killing a perfectly good window.
+        return true
+    end
+    return code[0] == STILL_ACTIVE
 end
 
 local function read_and_clear(path)
@@ -48,6 +91,19 @@ mp.add_periodic_timer(0.2, function()
         end
     end
 end)
+
+-- Orphan-window guard (issue #6): when our owner process is gone, quit.
+-- Every 1s is plenty: the failure mode is "daemon died", not "daemon dying",
+-- and a sub-second delay in noticing costs nothing.
+if parent_pid then
+    mp.add_periodic_timer(1.0, function()
+        if not parent_is_alive() then
+            log("parent pid " .. parent_pid .. " gone -- quitting")
+            mp.commandv("quit")
+        end
+    end)
+    log("orphan guard armed: parent pid " .. parent_pid)
+end
 
 -- Publish playback state so the Python side can read it back. We have no
 -- request/response channel (no IPC), so state is pushed to a file instead.

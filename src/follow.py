@@ -31,10 +31,13 @@ import os
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import crashlog                                             # noqa: E402
 
 from matcher import (                                          # noqa: E402
     MIN_ACCEPTABLE_SCORE,
@@ -1158,6 +1161,42 @@ class Follower:
         self._worker.start()
 
     def _switch_to(self, session: NowPlaying, key: TrackKey) -> None:
+        """Run the song switch in a worker thread, recording any death.
+
+        WHY THE WRAPPER (issue #6, measured 2026-10-08)
+        ----------------------------------------------
+        The `except` used to guard ONLY `self.matcher.match(...)`. Everything
+        after it -- stream resolution, window cleanup, the coarse seek, capture
+        and fine alignment -- ran unprotected. This thread is `daemon=True`, so
+        an exception there did NOT stop the main loop; the thread simply died
+        and the default `threading.excepthook` wrote to stderr, which the
+        recommended launcher may not capture. The daemon then kept polling with
+        a half-finished switch, and the process later exited with the log
+        ending mid-sentence -- exactly the state issue #6 had to diagnose by
+        reading the process table.
+
+        Two things changed:
+          1. the whole body is protected, so a failure is always reported;
+          2. it is reported through `crashlog`, which persists phase + traceback
+             to `state/_evidence/crash.log` even if the main log is lost.
+        """
+        crashlog.phase(f"switch:{session.title[:40]}")
+        try:
+            self._switch_to_impl(session, key)
+        except Exception as exc:  # noqa: BLE001 - a worker must never die silently
+            crashlog.record("WORKER-EXCEPTION",
+                            f"  song={session.title!r} artist={session.artist!r}\n"
+                            f"  {type(exc).__name__}: {exc}\n"
+                            f"  {traceback.format_exc().rstrip()}")
+            self.log(f"  ✗ 切歌线程异常（已记入 crash.log）: "
+                     f"{type(exc).__name__}: {exc}")
+            # Put the daemon back in a defined state: without this, `_pending`
+            # stays set and the loop believes a switch is still in flight.
+            with self._lock:
+                if self._pending == key:
+                    self._pending = None
+
+    def _switch_to_impl(self, session: NowPlaying, key: TrackKey) -> None:
         """Find a PV for this session and start playing it (runs in a thread)."""
         try:
             result = self.matcher.match(
@@ -1904,6 +1943,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_follow(args: argparse.Namespace) -> int:
+    # Install crash recording BEFORE anything else can fail (issue #6). Every
+    # abnormal death then leaves a phase + traceback in state/_evidence/crash.log.
+    crashlog.install()
+    crashlog.phase("acquiring-lock")
+
     # Single-instance guard. Two followers means two mpv windows fighting over
     # one command file, which the user experienced as "every new song opens 3
     # windows and the stale ones never close".
@@ -1916,8 +1960,11 @@ def _run_follow(args: argparse.Namespace) -> int:
         print(f"✗ 已经有一个跟随进程在运行（PID {exc.pid}）。")
         print("  同时运行多个会导致多个视频窗口互抢。")
         print("  如确认它已卡死，请结束该进程，或删除 state\\.follow.lock 后重试。")
+        crashlog.record("EXIT-ALREADY-RUNNING", f"  holder pid={exc.pid}")
         return 1
 
+    exit_reason = "unknown"
+    f: Follower | None = None
     try:
         f = Follower(
             matcher=Matcher(),
@@ -1931,8 +1978,35 @@ def _run_follow(args: argparse.Namespace) -> int:
                   "若音乐已播到中间，画面会明显滞后。")
         if args.align:
             f.log("提示: 已开启 --align 互相关微调，每次切歌会慢约 10s+")
+        crashlog.phase("following")
         f.run(duration_sec=args.duration)
+        exit_reason = "normal-return"
+    except KeyboardInterrupt:
+        exit_reason = "keyboard-interrupt"
+        raise
+    except BaseException as exc:
+        # A main-thread failure must be recorded here too: the `finally` below
+        # still releases the lock, but without this record the only evidence
+        # would be sys.excepthook -- which does not run for SystemExit and is
+        # easy to lose when stderr is redirected.
+        exit_reason = f"main-exception:{type(exc).__name__}"
+        crashlog.record("MAIN-EXCEPTION",
+                        f"  {type(exc).__name__}: {exc}\n"
+                        f"  {traceback.format_exc().rstrip()}")
+        raise
     finally:
+        crashlog.record("EXIT", f"  reason={exit_reason}")
+        # Stop the mpv we own, on EVERY exit path including an exception.
+        # WHY (issue #6): the old code only released the lock here, so an
+        # exception escaping `f.run()` left our mpv running with no daemon --
+        # an orphan window that outlived the process and got reported as
+        # "whitelist not working". `f` may be None if the constructor failed.
+        try:
+            if f is not None:
+                f.player.stop()
+                crashlog.record("EXIT-CLEANUP", "  player.stop() done")
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            crashlog.record("EXIT-CLEANUP-FAILED", f"  {type(exc).__name__}: {exc}")
         lock.release()
     return 0
 

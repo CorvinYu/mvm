@@ -875,6 +875,19 @@ def test_lua_control_contract() -> None:
     check("提供 script-message 测试缝（同一条代码路径）",
           'register_script_message("mvm-nudge"' in src)
 
+    # --- orphan guard (issue #6) -----------------------------------------
+    # Static contract only: the LIVE behaviour is proven by
+    # `python src/probe_orphan_guard.py` (starts a real mpv whose recorded
+    # parent pid is already dead and asserts it exits by itself).
+    check("读 MVM_PARENT_PID（孤儿守卫的开关）",
+          "MVM_PARENT_PID" in src)
+    check("父进程消失时执行 quit",
+          "parent_is_alive" in src and 'mp.commandv("quit")' in src)
+    check("无 ffi 时假定父进程存活（绝不自杀）",
+          "if not ok then return true end" in src)
+    check("父 PID 缺失时不武装守卫（单机测试不受影响）",
+          "if parent_pid then" in src)
+
     # mp.log must never be called with one argument: it raises
     # "Invalid log level" and kills the script (documented in the file).
     bad_log = [
@@ -882,6 +895,57 @@ def test_lua_control_contract() -> None:
         if "mp.log(" in line and line.count(",") == 0 and "local function" not in line
     ]
     check("mp.log 均为「level + 消息」两个参数", not bad_log, f"{bad_log}")
+
+
+def test_crash_observability() -> None:
+    """20. Crash record + orphan guard contract (issue #6).
+
+    WHY here as well as in test_crashlog.py: that file is the *negative* proof
+    (it fails on the old code). This section is the cheap always-on smoke check
+    so a future edit cannot silently remove the hooks.
+    """
+    print("\n=== 20. 崩溃留痕 + 孤儿守卫（issue #6）===")
+    try:
+        import crashlog
+    except Exception as exc:  # noqa: BLE001
+        check("crashlog 可导入", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    check("crashlog 可导入", True)
+    check("install() 幂等且首次返回 True",
+          crashlog.install(enable_faulthandler=False) in (True, False))
+
+    # It must write, but to a scratch file so the real crash.log is not polluted.
+    scratch = ROOT / "state" / "_selftest_crash"
+    scratch.mkdir(parents=True, exist_ok=True)
+    probe = scratch / "crash.log"
+    probe.unlink(missing_ok=True)
+    saved_log, saved_dir = crashlog.CRASH_LOG, crashlog.EVIDENCE_DIR
+    try:
+        crashlog.CRASH_LOG, crashlog.EVIDENCE_DIR = probe, scratch
+        crashlog.phase("selftest")
+        wrote = crashlog.record("SELFTEST-PROBE", "  detail")
+        text = probe.read_text(encoding="utf-8", errors="replace") if probe.exists() else ""
+        check("record() 写入成功", wrote is True)
+        check("记录含 phase / pid / uptime",
+              all(k in text for k in ("phase=selftest", "pid=", "uptime=")))
+    finally:
+        crashlog.CRASH_LOG, crashlog.EVIDENCE_DIR = saved_log, saved_dir
+
+    # The follower must actually install the hooks and clean up on exit.
+    follow_src = (ROOT / "src" / "follow.py").read_text(encoding="utf-8")
+    check("_run_follow 安装崩溃钩子", "crashlog.install()" in follow_src)
+    check("退出路径记录退出原因", 'crashlog.record("EXIT"' in follow_src)
+    check("退出路径无论异常都停止 mpv（防孤儿）",
+          "f.player.stop()" in follow_src.split("finally:")[-1])
+    check("worker 全函数体包异常（不只 match）",
+          "_switch_to_impl" in follow_src
+          and "WORKER-EXCEPTION" in follow_src)
+
+    # player.py must hand the parent pid to mpv.
+    player_src = (ROOT / "src" / "player.py").read_text(encoding="utf-8")
+    check("player 传入 MVM_PARENT_PID",
+          'env["MVM_PARENT_PID"]' in player_src)
 
 
 def main() -> int:
@@ -906,6 +970,7 @@ def main() -> int:
     test_manual_calibration()
     test_pending_offset_channel()
     test_lua_control_contract()
+    test_crash_observability()
 
     print("\n" + "=" * 60)
     total = _passed + _failed

@@ -988,6 +988,12 @@ class MpvController:
             # Hand the manual-offset sidecar paths to the Lua hotkeys (task-2).
             env["MVM_MANUAL_FILE"] = str(MANUAL_FILE)
             env["MVM_MANUAL_TMP"] = str(MANUAL_TMP)
+            # Tell mpv which Python process owns it, so the Lua side can quit
+            # when that process dies (issue #6). Compares launcher PIDs rather
+            # than recording the child's parent pid: the launcher may itself be
+            # wrapped (tools/run_follow_utf8.py), and the pid we embed here is
+            # the one this very process controls.
+            env["MVM_PARENT_PID"] = str(os.getpid())
 
             try:
                 self.proc = subprocess.Popen(
