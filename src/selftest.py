@@ -637,6 +637,253 @@ def test_single_window_invariant() -> None:
     ctl.stop()
 
 
+def test_manual_calibration() -> None:
+    """Manual alignment: two-level storage, additive semantics, persistence.
+
+    Regression coverage for task-2. The single most important property is the
+    SEMANTICS: the closed loop corrects alignment ERROR while a manual nudge
+    expresses user PREFERENCE, and the two are ADDED. If a manual value were
+    merged into the auto error, the loop would cancel the user's nudge within
+    a poll cycle and the buttons would appear broken -- so there is an
+    explicit case for it below.
+
+    Every case here is offline: a scratch directory plus a JSON file, no
+    player and no network.
+    """
+    print("\n=== 17. 手动校准存储（两级回退 + 手动/闭环相加）===")
+    import json
+    import shutil
+    import tempfile
+
+    from align_calib import (
+        MAX_ABS_OFFSET_SEC,
+        CalibrationStore,
+        make_track_key,
+        normalise_title,
+    )
+
+    # A scratch dir INSIDE the project: tempfile.mkdtemp() lands somewhere the
+    # sandbox may deny writes to (measured: WinError 5 on a tempdir created by
+    # another security context), which would make this test fail for reasons
+    # unrelated to calibration.
+    work = STATE / "_selftest_calib"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    path = work / "align_calib.json"
+
+    try:
+        store = CalibrationStore(path)
+        track = make_track_key("幹物女(WeiWei)", "Z新豪", 222.0)
+        other = make_track_key("另一首歌", "别人", 180.0)
+
+        check("空校准 -> 偏移 0 且来源为「无」",
+              store.manual_offset(track, "cloudmusic.exe") == 0.0
+              and store.inherited_from(track, "cloudmusic.exe") == "无")
+
+        app_entry = store.save_as_app_default("cloudmusic.exe", 0.3)
+        check("写入 app 级校准成功落盘",
+              abs(app_entry.offset_sec - 0.3) < 1e-9 and path.exists())
+
+        check("歌曲级缺失时回退到 app 级",
+              store.manual_offset(track, "cloudmusic.exe") == 0.3
+              and store.inherited_from(track, "cloudmusic.exe") == "app级")
+
+        # The nudge must refine the inherited baseline, not discard it.
+        entry = store.record_manual_nudge(track, "cloudmusic.exe", 0.2)
+        check("首次手动微调以 app 级为起点累加（0.3+0.2=0.5）",
+              abs(entry.offset_sec - 0.5) < 1e-6, f"{entry.offset_sec}")
+
+        check("歌曲级优先于 app 级",
+              store.manual_offset(track, "cloudmusic.exe") == 0.5
+              and store.inherited_from(track, "cloudmusic.exe") == "歌曲级")
+
+        check("同一 app 的其他歌曲仍走 app 级",
+              store.manual_offset(other, "cloudmusic.exe") == 0.3
+              and store.inherited_from(other, "cloudmusic.exe") == "app级")
+
+        check("未知 app -> 无继承、偏移 0",
+              store.manual_offset(other, "spotify.exe") == 0.0
+              and store.inherited_from(other, "spotify.exe") == "无")
+
+        check("手动微调可累积（再 +0.2 -> 0.7）",
+              store.record_manual_nudge(track, "cloudmusic.exe", 0.2).offset_sec
+              == 0.7)
+
+        # D: the core semantic -- auto error and manual preference are ADDED,
+        # never merged. This is what keeps a nudge from being cancelled.
+        eff = store.get_effective_offset(track, "cloudmusic.exe", auto_error=-0.25)
+        check("闭环误差与手动偏好相加（-0.25 + 0.7 = 0.45）",
+              abs(eff.total - 0.45) < 1e-9 and abs(eff.auto_error + 0.25) < 1e-9,
+              eff.describe())
+        check("两部分仍可分别读取（不会被合并成一个数）",
+              abs(eff.manual - 0.7) < 1e-9)
+
+        check("偏移被限幅（+99 -> 上限）",
+              store.set_manual_offset(track, "cloudmusic.exe", 99.0).offset_sec
+              == MAX_ABS_OFFSET_SEC,
+              f"上限 {MAX_ABS_OFFSET_SEC}")
+        check("负向同样限幅",
+              store.set_manual_offset(track, "cloudmusic.exe", -99.0).offset_sec
+              == -MAX_ABS_OFFSET_SEC)
+
+        # Persistence: a NEW store must see the same values (proves the file,
+        # not an in-memory cache, is the source of truth).
+        reloaded = CalibrationStore(path)
+        check("落盘后可被新实例读回",
+              reloaded.manual_offset(track, "cloudmusic.exe")
+              == -MAX_ABS_OFFSET_SEC
+              and reloaded.app_offset("cloudmusic.exe") == 0.3)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        check("JSON 结构含 tracks/apps 两级",
+              "tracks" in raw and "apps" in raw and raw.get("version") == 1,
+              f"keys={sorted(raw.keys())}")
+
+        # reset semantics: setting 0 on the song level leaves the app level,
+        # so "重置本歌" returns the user to the inherited baseline.
+        store.set_manual_offset(track, "cloudmusic.exe", 0.0)
+        check("重置本歌后回落到 app 级基线",
+              store.manual_offset(track, "cloudmusic.exe") == 0.0
+              and store.inherited_from(track, "cloudmusic.exe") == "歌曲级")
+
+        store.clear_track(track)
+        check("清除歌曲级后回退 app 级",
+              store.manual_offset(track, "cloudmusic.exe") == 0.3
+              and store.inherited_from(track, "cloudmusic.exe") == "app级")
+
+        # A corrupt file must not be fatal: losing one song's calibration is
+        # better than refusing to start the follower.
+        path.write_text("{ this is not json", encoding="utf-8")
+        broken = CalibrationStore(path)
+        check("损坏的 JSON 被忽略而非抛异常",
+              broken.manual_offset(track, "cloudmusic.exe") == 0.0)
+
+        # TrackKey normalisation must agree with follow.py's, or a calibration
+        # saved under one spelling would be missed under another.
+        check("标题归一化与 follow.py 一致（去装饰/去艺术家后缀）",
+              normalise_title("勾指起誓 - 洛天依") == "勾指起誓"
+              and normalise_title("Song【官方】") == "song"
+              and normalise_title("Song (Live)") == "song",
+              repr(normalise_title("Song【官方】")))
+        check("时长抖动不影响 key（同一 10s 桶）",
+              make_track_key("a", "b", 183.5) == make_track_key("a", "b", 184.9),
+              make_track_key("a", "b", 183.5))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_pending_offset_channel() -> None:
+    """The GUI/hotkey -> follower request channel must deliver exactly once.
+
+    The control window and the mpv hotkeys must NOT drive mpv directly (the
+    follower owns the player and the closed loop would fight a second writer),
+    so they publish a pending offset and the follower applies it. A stuck
+    button must not re-seek the video forever, hence the consume-once
+    behaviour checked here.
+    """
+    print("\n=== 18. 待施加手动偏移通道（GUI/热键 -> 守护）===")
+    import shutil
+
+    from align_calib import (
+        clear_pending_offsets,
+        consume_pending_offsets,
+        publish_pending_offset,
+        read_pending_offsets,
+    )
+
+    work = STATE / "_selftest_pending"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    path = work / "pending.txt"
+    try:
+        check("空通道读出空列表", read_pending_offsets(path) == [])
+
+        check("发布成功",
+              publish_pending_offset(0.7, "song|a|22", "cloudmusic.exe",
+                                     source="gui", path=path))
+
+        items = read_pending_offsets(path)
+        check("读取到 1 条请求",
+              len(items) == 1 and abs(items[0]["offset_sec"] - 0.7) < 1e-9,
+              f"{items}")
+        check("请求带来源标签（GUI 与热键可区分）",
+              items[0]["source"] == "gui" and items[0]["track_key"] == "song|a|22")
+
+        # Append-only: two writers in the same window must not clobber.
+        publish_pending_offset(-0.1, "song|a|22", "cloudmusic.exe",
+                               source="hotkey", path=path)
+        check("多条请求共存（追加而非覆盖）",
+              len(read_pending_offsets(path)) == 2)
+
+        consumed = consume_pending_offsets(path)
+        check("消费后文件被清空（不会重复施加）",
+              len(consumed) == 2 and read_pending_offsets(path) == [],
+              f"consumed={len(consumed)}")
+
+        # A malformed line must be skipped, not poison the whole queue.
+        path.write_text("garbage\n\n999.0\t0.5\tt\tcloudmusic.exe\tgui\n",
+                        encoding="utf-8")
+        items = read_pending_offsets(path)
+        check("残缺行被跳过，正常行仍可读",
+              len(items) == 1 and abs(items[0]["offset_sec"] - 0.5) < 1e-9,
+              f"{items}")
+
+        clear_pending_offsets(path)
+        check("清空通道", read_pending_offsets(path) == [])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_lua_control_contract() -> None:
+    """mvm_control.lua must keep the contract the Python side relies on.
+
+    This is a static check of the Lua source, and it is here because every one
+    of these properties was broken at least once during task-2 (all measured):
+
+      * `set`, not `set_property` -- the wrong name silently does nothing
+        (rule 20);
+      * hotkey bindings present AND not disabled by a bogus guard -- an
+        earlier version gated them on `options/no-config`, which reports
+        something other than yes/true when --config-dir is also passed, so the
+        keys were never bound while the log claimed they were "disabled";
+      * the manual offset published as line 5 of the status file, which is how
+        Python and the control window read it back;
+      * `mp.log` always called with (level, message) -- a single argument
+        raises and kills the script.
+    """
+    print("\n=== 19. Lua 控制脚本契约（静态检查）===")
+    lua = ROOT / "config" / "scripts" / "mvm_control.lua"
+    if not lua.exists():
+        check("mvm_control.lua 存在", False, str(lua))
+        return
+
+    src = lua.read_text(encoding="utf-8")
+    check("使用 set 而非 set_property（铁律 20）",
+          "set_property" not in src)
+    check("注册了六个手动微调绑定",
+          all(name in src for name in (
+              "mvm_nudge_m01", "mvm_nudge_p01", "mvm_nudge_m1",
+              "mvm_nudge_p1", "mvm_nudge_reset0", "mvm_nudge_reset")))
+    check("绑定用 forced 优先级（不被 input.conf 抢占）",
+          src.count("add_forced_key_binding") >= 6)
+    check("没有把热键误锁在 no-config 判据后面",
+          "manual hotkeys DISABLED" not in src)
+    check("状态文件写第 5 行手动偏移",
+          "%.3f\\n" in src and "manual_offset" in src)
+    check("提供 script-message 测试缝（同一条代码路径）",
+          'register_script_message("mvm-nudge"' in src)
+
+    # mp.log must never be called with one argument: it raises
+    # "Invalid log level" and kills the script (documented in the file).
+    bad_log = [
+        line.strip() for line in src.splitlines()
+        if "mp.log(" in line and line.count(",") == 0 and "local function" not in line
+    ]
+    check("mp.log 均为「level + 消息」两个参数", not bad_log, f"{bad_log}")
+
+
 def main() -> int:
     print("music-video-matcher 自检")
     print("=" * 60)
@@ -656,6 +903,9 @@ def main() -> int:
     test_single_instance()
     test_quality_gate()
     test_single_window_invariant()
+    test_manual_calibration()
+    test_pending_offset_channel()
+    test_lua_control_contract()
 
     print("\n" + "=" * 60)
     total = _passed + _failed

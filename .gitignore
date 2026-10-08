@@ -26,14 +26,28 @@ vendor/
 
 # ---------------------------------------------------------------------------
 # Runtime state, logs, caches
+#
+# These files are created while mvm runs. Several of them carry YOUR data:
+#   state/align_calib.json  -- your manual alignment preferences
+#   state/window.json       -- your window position
+# so they must never be published even though they hold no credentials.
 # ---------------------------------------------------------------------------
 logs/
 state/_mvm_cmd.txt
 state/_mvm_status.txt
+state/_mvm_now.json
+state/_mvm_hotkey_offset.txt
+state/_mvm_hotkey_offset.tmp
+state/_mvm_manual_offset.txt
 state/.follow.lock
+state/.align_control.lock
+state/align_calib.json
+state/window.json
 state/vocadb_cache/
 state/_align_work/
 state/_selftest_align/
+state/_wiring_test/
+state/_evidence/
 state/_tmp/
 state/delay_history.json
 

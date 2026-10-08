@@ -4,7 +4,7 @@ WHY THIS MODULE EXISTS
     The first version of this project hard-coded absolute paths from the
     machine it was developed on, e.g.
 
-        FFMPEG = Path(r"D:\\software\\ffmpeg-8.1.1-essentials_build\\bin\\ffmpeg.exe")
+        FFMPEG = Path(r"D:\\some\\machine\\specific\\ffmpeg.exe")
 
     That made the code unusable anywhere else (and leaked a local directory
     layout into a public repository). Everything machine-specific now resolves

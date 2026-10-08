@@ -54,6 +54,68 @@ STATE_DIR = ROOT / "state"
 CMD_FILE = STATE_DIR / "_mvm_cmd.txt"
 STATUS_FILE = STATE_DIR / "_mvm_status.txt"
 
+# Manual-alignment sidecar (task-2 / session 8).
+#
+# The mpv hotkeys ([ ] { } 0 \) move the playhead by a relative amount and write
+# the CUMULATIVE manual offset to MANUAL_FILE, atomically via MANUAL_TMP. The
+# follower polls MANUAL_FILE and persists new values through align_calib, so a
+# user's nudge survives the song and can be inherited by later songs.
+#
+# WHY A SIDECAR INSTEAD OF JUST STATUS_FILE LINE 5: the status file is rewritten
+# every 0.5s and also carries time-pos; a reader cannot tell "the manual offset
+# changed" from "the position advanced". The sidecar only ever changes when the
+# USER acts, which makes it a reliable trigger. Both are exposed because the Lua
+# side writes them together.
+#
+# NAME MATTERS (a real collision found during wiring): this must NOT be
+# `_mvm_manual_offset.txt`, which is align_calib.PENDING_FILE -- a completely
+# different channel. PENDING_FILE is a tab-separated REQUEST log written by the
+# GUI ("please set the offset to X") and consumed by the follower, whereas this
+# sidecar is a single float written by mpv's Lua ("the user has nudged by Y so
+# far"). Pointing them at one file would make each side parse the other's format
+# and silently lose every nudge. Distinct names keep the two channels honest.
+#
+# These paths are handed to mpv via MVM_MANUAL_FILE / MVM_MANUAL_TMP (see
+# start()), which is how the Lua script learns them -- it cannot import Python.
+MANUAL_FILE = STATE_DIR / "_mvm_hotkey_offset.txt"
+MANUAL_TMP = STATE_DIR / "_mvm_hotkey_offset.tmp"
+
+# How long to wait for a freshly spawned mpv to become usable.
+#
+# Measured 2026-10-08: a small window (~982x596) is ready in ~1.5s, but a large
+# one (1942x1136) spends ~16s in GPU/libplacebo initialisation first. The old
+# fixed 1.5s sleep therefore declared "mpv 启动失败" for launches that were
+# merely slow.
+#
+# TWO budgets, because they answer different questions:
+#   * START_READY_TIMEOUT_SEC -- how long we BLOCK inside start() waiting for
+#     evidence that THIS process is up. start() holds `_lifecycle_lock`, which
+#     the follower's poll loop needs for stop() during a song change, so this
+#     must stay short: 6s covers the small-window case (~1.5s) with room, and a
+#     slow large-window launch simply proceeds without us (the geometry guard
+#     and the status file catch up on the next poll).
+#   * START_TIMEOUT_SEC -- the absolute ceiling after which a launch is
+#     considered failed by callers that want to wait longer.
+START_READY_TIMEOUT_SEC = 6.0
+START_TIMEOUT_SEC = 25.0
+
+# ---------------- seek verification tuning (session 8) ----------------
+#
+# Context. mvm_control.lua rewrites STATUS_FILE's time-pos every 0.5s and polls
+# CMD_FILE every 0.2s, so any readback we do carries up to ~0.7s of latency.
+# These constants are sized so the verification catches GROSS failures (a clamped
+# or dropped seek) without ever rejecting a normal, healthy landing.
+#
+# Baseline for scale (NOTES.md §1): the measured steady-state A/V offset on this
+# machine is 0.2-0.6s, and >3s is treated as a real fault. The verification
+# tolerance therefore sits at 1.0s late / 1.5s early -- comfortably wider than
+# normal jitter (so it does not cry wolf) and comfortably narrower than the 3s
+# fault threshold (so it does catch the failures worth catching).
+SEEK_VERIFY_TOLERANCE_SEC = 1.0        # how far AHEAD of target we still accept
+SEEK_VERIFY_LATE_TOLERANCE_SEC = 1.5   # how far BEHIND target we still accept
+SEEK_VERIFY_SETTLE_SEC = 0.8           # wait before reading back (0.2s poll + 0.5s writer + mpv latency)
+SEEK_VERIFY_ATTEMPTS = 2               # one retry: a single re-issue fixes a dropped command
+
 # Optional cookie file. bilibili REQUIRES a logged-in cookie or it returns 412.
 # NEVER commit a real cookies.txt: it holds your account session. Set MVM_COOKIES
 # to reuse a file kept elsewhere rather than editing machine paths into the code.
@@ -250,6 +312,16 @@ def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
     self-resizes jump to a much larger area (typically filling the screen).
     So we accept a change only if the area grows by less than 50% and the
     window still covers less than 70% of the work area.
+
+    WHY A PER-CHANGE TEST IS STILL NOT ENOUGH (measured 2026-10-08):
+        mpv's growth is INCREMENTAL. A window at 982x596 was observed being
+        adopted at 1618x1136 and then at 1942x1136 -- each step within 1.5x of
+        the previous value, so the per-change rule accepted every one of them
+        and the "polluted geometry" the docstring above warns about came back
+        through a series of individually-plausible steps. A user's drag is a
+        one-off event, so the comparison must also be made against the window's
+        ORIGINAL size for this launch, which `pinned` no longer represents once
+        a step has been adopted.
     """
     px, py, pw, ph = pinned
     x, y, w, h = rect
@@ -263,6 +335,22 @@ def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
     if area > 1.5 * float(pw * ph):
         return False                      # sudden big growth: not a drag
     return True
+
+
+# Ceiling on how much the window may grow through a SEQUENCE of adopted
+# changes, relative to the size it had when this mpv was launched. Chosen at
+# 2.0x: a user who deliberately enlarges the window does it once (and that one
+# step is judged by _is_plausible_user_resize above), whereas mpv's runaway
+# growth is cumulative and crosses 2x within a couple of steps -- measured
+# 982x596 -> 1618x1136 (3.1x area) -> 1942x1136 (3.8x area).
+MAX_CUMULATIVE_GROWTH = 2.0
+
+# Smallest window rectangle worth remembering (physical px). Below this the
+# measurement is a transient artefact of a window that has not been laid out
+# yet, not a size the user chose -- measured 202x100 while mpv was initialising.
+# DEFAULT_WINDOW_W/H (982x596) is the intended first-run size, so this is a
+# floor against nonsense rather than a constraint on legitimate resizing.
+MIN_WINDOW_SIZE_PX = (320, 240)
 
 
 def rect_on_screen(rect: tuple[int, int, int, int]) -> bool:
@@ -581,6 +669,12 @@ class MpvController:
             self._geometry = default_window_rect()
             self._frame = DEFAULT_FRAME
         self._geometry_lock = threading.Lock()
+        # The size the window had when this mpv was launched. Used to reject
+        # CUMULATIVE growth: mpv's self-resizes arrive as a series of steps that
+        # each look plausible against the previous value (see
+        # _is_plausible_user_resize), so the running value cannot be the only
+        # baseline. Set in start(); None until then.
+        self._launch_area: float | None = None
         self._geometry_thread: threading.Thread | None = None
         # When the guard must ENFORCE the rectangle rather than adopt a new one.
         self._enforce_until = 0.0
@@ -702,7 +796,18 @@ class MpvController:
         `measurable=False` when `rect` was NOT requested through --geometry
         (a window the user dragged): the frame offsets cannot be re-derived from
         it, so the previously learned ones are carried over unchanged.
+
+        REFUSES to persist an implausible rectangle. WHY (measured 2026-10-08):
+        while mpv was still initialising, GetWindowRect returned a degenerate
+        202x100 at (38,38) with a 1718x980 "frame" -- and because this value is
+        PERSISTED, the next launch would have opened a pin-hole window and then
+        reproduced that nonsense border offset. A rectangle below
+        MIN_WINDOW_SIZE_PX is a transient artefact of the window not being laid
+        out yet, not something the user asked for, so it is dropped rather than
+        remembered. The previously good value stays in place.
         """
+        if rect[2] < MIN_WINDOW_SIZE_PX[0] or rect[3] < MIN_WINDOW_SIZE_PX[1]:
+            return
         frame = self._measure_frame() if measurable else self._frame
         self._geometry = rect
         save_window_state(rect, frame)
@@ -837,17 +942,52 @@ class MpvController:
         with self._lifecycle_lock:
             if self.running:
                 return True
+
+            # Make sure the PREVIOUS process is really gone before spawning a
+            # new one. WHY (measured 2026-10-08: the user saw TWO windows while
+            # one daemon ran):
+            #
+            #   * `stop()` sets `self.proc = None` UNCONDITIONALLY, even when
+            #     terminate() did not actually kill the process. A surviving mpv
+            #     therefore becomes an ORPHAN: nobody references it, and the
+            #     follower's one-window cleanup only runs on song changes with a
+            #     live pid to protect -- so the next start() spawned a SECOND
+            #     window next to it.
+            #   * `self.proc` can also still point at a live child (a start()
+            #     that never got reaped), so that one is terminated too.
+            #
+            # Both cases are handled here, at the single place where a new mpv
+            # comes into existence, because that is the only point where the
+            # invariant "at most one MVM window" can be enforced without
+            # guessing which pid to protect.
+            self._terminate_proc()
+            if self.pid is None:
+                # We own nothing right now: anything with our binary path is a
+                # leftover, so it is safe to clear (allow_when_unknown=True).
+                strays = self.kill_stray_windows(allow_when_unknown=True)
+                if strays:
+                    self._log_line(f"  · 启动前清理了 {strays} 个残留视频窗口")
+
             # Fresh command/status files so a stale command is not replayed.
             try:
                 CMD_FILE.write_text("", encoding="utf-8")
                 if STATUS_FILE.exists():
                     STATUS_FILE.unlink()
+                # The manual-offset sidecar belongs to a previous mpv run: a new
+                # run starts with no manual offset, so leaving the old value
+                # would make the follower record a nudge the user never made in
+                # THIS session.
+                if MANUAL_FILE.exists():
+                    MANUAL_FILE.unlink()
             except OSError:
                 pass
 
             env = dict(os.environ)
             env["MVM_CMD_FILE"] = str(CMD_FILE)
             env["MVM_STATUS_FILE"] = str(STATUS_FILE)
+            # Hand the manual-offset sidecar paths to the Lua hotkeys (task-2).
+            env["MVM_MANUAL_FILE"] = str(MANUAL_FILE)
+            env["MVM_MANUAL_TMP"] = str(MANUAL_TMP)
 
             try:
                 self.proc = subprocess.Popen(
@@ -859,8 +999,51 @@ class MpvController:
                 )
             except OSError:
                 return False
-            time.sleep(1.5)   # let the window and the Lua timer come up
+
+            # Wait for the window and the Lua timer to come up.
+            #
+            # WAS a fixed `time.sleep(1.5)` and that is not enough in general:
+            # measured 2026-10-08, when state/window.json holds a large
+            # rectangle mpv spends ~16s in GPU/libplacebo initialisation before
+            # it is usable, so the 1.5s check saw `running == False` and the
+            # caller reported "mpv 启动失败" for a process that was in fact
+            # starting normally. The geometry can legitimately be large (the
+            # user may drag the window big), so the wait must follow the
+            # process rather than assume a fixed cost.
+            #
+            # THE WAIT IS BOUNDED AND PROCESS-BOUND. An earlier version of this
+            # loop broke as soon as STATUS_FILE existed -- but that file is
+            # written by whichever mpv is running, so a leftover file (or a
+            # dying previous instance) satisfied it immediately and `start()`
+            # returned while the NEW mpv was still initialising. The loop now
+            # waits for evidence that THIS process is up: either its window
+            # exists, or the status file has been rewritten after our spawn.
+            # START_READY_TIMEOUT_SEC is deliberately much shorter than the
+            # absolute START_TIMEOUT_SEC, because this method holds
+            # `_lifecycle_lock` and the follower's poll loop needs `stop()` to
+            # stay responsive during a song change.
+            spawn_time = time.time()
+            deadline = time.monotonic() + START_READY_TIMEOUT_SEC
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    # mpv exited on its own: a real failure (bad option, missing
+                    # binary), not slowness. Report it now instead of waiting.
+                    return False
+                if self._find_window():
+                    break
+                try:
+                    if STATUS_FILE.stat().st_mtime >= spawn_time:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+
             if self.running:
+                # Remember the launch size, so the guard can reject cumulative
+                # growth rather than judging each step in isolation.
+                if self._geometry:
+                    self._launch_area = float(self._geometry[2]
+                                              * self._geometry[3])
                 # Enforce the remembered rectangle for a while after launch:
                 # mpv re-centres itself a few seconds after a video loads
                 # (measured t~9s and t~20.8s), so a moved window in this period
@@ -899,6 +1082,38 @@ class MpvController:
                     except OSError:
                         pass
             self.proc = None
+
+    def _terminate_proc(self) -> None:
+        """Terminate `self.proc` if it is still alive, and forget it.
+
+        Used by start() before spawning a replacement. WHY it must be explicit
+        (measured 2026-10-08, user saw TWO windows from ONE daemon): the
+        previous process can still be running while `self.running` reports False
+        (it exited just far enough for poll() to return, or was never reaped),
+        and spawning a new mpv then leaves both windows on screen. `stop()`
+        cannot be reused here because it also persists window geometry and
+        starts a guard -- this is purely "make sure the old child is dead".
+
+        Never raises: a failure to kill is reported by `running` being False
+        anyway, and the next cleanup pass will retry.
+        """
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except OSError:
+            pass
+        self.proc = None
 
     @property
     def running(self) -> bool:
@@ -995,6 +1210,12 @@ class MpvController:
 
         There is no request/response channel (no IPC), so the Lua script pushes
         state to a file and we read it back. Returns None when unavailable.
+
+        NOTE: this value describes the playhead as of the LAST REWRITE, not as
+        of this read -- see `status_file_age()`. Any caller comparing it against
+        another clock must add that age, or it will systematically under-
+        estimate where the video is (measured effect: a closed loop that pushed
+        the picture forward every cycle, chasing its own 0.5s error).
         """
         try:
             lines = STATUS_FILE.read_text(encoding="utf-8").splitlines()
@@ -1007,6 +1228,19 @@ class MpvController:
         except ValueError:
             return None
 
+    def status_file_age(self) -> float:
+        """Seconds since the status file was last written (0.0 if unknown).
+
+        mvm_control.lua rewrites STATUS_FILE every 0.5s, so a position read from
+        it is between 0 and 0.5s old. The mtime is exactly when the value was
+        produced, which makes it the correct amount to add when converting a
+        stored position into "where the video is now".
+        """
+        try:
+            return max(0.0, time.time() - STATUS_FILE.stat().st_mtime)
+        except OSError:
+            return 0.0
+
     def seek(self, position_sec: float, exact: bool = True) -> bool:
         """Jump the running video to an absolute position.
 
@@ -1014,9 +1248,90 @@ class MpvController:
         video's own audio track is muted, so shifting it leaves the picture
         untouched. Measured: logs reported a computed offset while the video
         stayed at 00:00:11 against music at 00:19.
+
+        NOTE (2026-10-07, session 8): a bare `seek` only appends a line to the
+        command file -- it proves nothing about where the playhead went. The
+        Lua side polls that file every 0.2s and mpv may CLAMP the request (past
+        the end of the file) or land the keyframe slightly off for a non-exact
+        seek. Fine alignment therefore uses `seek_verified()` below; this
+        primitive stays for callers that genuinely do not need the readback
+        (e.g. the manual-nudge path, where the user sees the result directly).
         """
         mode = "absolute+exact" if exact else "absolute"
         return self.command(f"seek {position_sec:.3f} {mode}")
+
+    def seek_verified(self, position_sec: float, exact: bool = True,
+                      tolerance: float = SEEK_VERIFY_TOLERANCE_SEC,
+                      settle: float = SEEK_VERIFY_SETTLE_SEC,
+                      attempts: int = SEEK_VERIFY_ATTEMPTS,
+                      ) -> tuple[bool, float | None]:
+        """Seek, then READ BACK the playhead and confirm the seek landed.
+
+        Returns (landed, observed_position). `observed` is the position that was
+        compared (already aged forward by the polling delay), or None when the
+        status file gave us nothing.
+
+        WHY THIS EXISTS (measured 2026-10-07, session 8)
+        -----------------------------------------------
+        `_seek_after_load` has verified its seek since session 7, but that
+        verification only ever ran on the LOAD path. The fine-alignment seek --
+        the one that decides whether the user sees a synced picture -- was a
+        fire-and-forget `player.seek(target)`: follow.py logged
+        "↻ 画面已校正到 83.5s" purely from the number it had COMPUTED.
+
+        Two concrete ways that number can be wrong while the log still claims
+        success:
+          * the 0.2s command-file poll means the seek lands up to ~0.2s later
+            than the music position we computed, and the video keeps playing
+            from there, and
+          * mpv CLAMPS an out-of-range target (a PV shorter than the music's
+            position) instead of failing, so the playhead ends up somewhere
+            else entirely with no error anywhere.
+
+        The tolerance is asymmetric on purpose. A seek that lands slightly
+        BEHIND the target is the normal case (the poll + keyframe snapping);
+        landing measurably AHEAD is worse, because the picture then spoils the
+        music. So `tolerance` is applied going forward and a tighter
+        SEEK_VERIFY_LATE_TOLERANCE_SEC going backward. Both are well inside the
+        deadband of the closed loop (ALIGN_LOOP_DEADBAND_SEC), so this check
+        never fights the corrector -- it only catches gross failures.
+        """
+        mode = "absolute+exact" if exact else "absolute"
+        for attempt in range(1, max(1, attempts) + 1):
+            if not self.command(f"seek {position_sec:.3f} {mode}"):
+                return (False, None)
+            # Wait for the poll + mpv's own seek latency. A `time.sleep(settle)`
+            # is deliberate here rather than a busy poll: the status file is
+            # rewritten every 0.5s (mvm_control.lua), so reading faster than
+            # that just returns the same sample again.
+            time.sleep(settle)
+            observed = self.get_position()
+            if observed is None:
+                # No readable position == no evidence. Report failure honestly
+                # instead of assuming the seek worked (铁律 12).
+                continue
+            # The video kept playing while we waited, so the playhead we read
+            # has advanced past the instant of the seek. Add that back before
+            # comparing, otherwise every seek looks "late" by the settle time.
+            expected = position_sec + settle
+            error = observed - expected
+            if -SEEK_VERIFY_LATE_TOLERANCE_SEC <= error <= tolerance:
+                return (True, observed)
+            if attempt < attempts:
+                self._log_line(
+                    f"  · seek 落点 {observed:.2f}s 偏离目标 {position_sec:.2f}s"
+                    f"（{error:+.2f}s），重试 {attempt}/{attempts - 1}…"
+                )
+        return (False, self.get_position())
+
+    def _log_line(self, msg: str) -> None:
+        """Print a player-side diagnostic when logging is enabled.
+
+        Kept on the controller (not the follower) because it reports a fact
+        only the player can observe -- where the playhead ACTUALLY landed.
+        """
+        if self.log:
+            print(msg, flush=True)
 
     # ---------------- playback ----------------
 
@@ -1054,7 +1369,23 @@ class MpvController:
             safe = stream_url.replace("\\", "/").replace('"', '\\"')
             if not self.command(f'loadfile "{safe}" replace'):
                 # Control channel failed -> fall back to a fresh process.
+                #
+                # THE OLD PROCESS MUST BE GONE BEFORE THE NEW ONE STARTS
+                # (measured 2026-10-08: the user saw TWO windows from ONE
+                # daemon). The chain that produced it:
+                #   * `command()` returns False when `running` is False, which
+                #     happens as soon as the child's poll() returns -- even if
+                #     the OS process (and its window) is still alive;
+                #   * `stop()` then clears `self.proc` UNCONDITIONALLY, so a
+                #     process that survived terminate() becomes an orphan that
+                #     nothing references any more;
+                #   * `_spawn_with_file()` started a SECOND mpv beside it.
+                # So the fallback now clears stray windows explicitly, with no
+                # pid to protect -- we own nothing at this point by definition.
                 self.stop()
+                strays = self.kill_stray_windows(allow_when_unknown=True)
+                if strays:
+                    self._log_line(f"  · 回退启动前清理了 {strays} 个残留视频窗口")
                 return self._spawn_with_file(stream_url, start_sec, effective_mute)
 
             # Coarse alignment: jump the video to where the music already is.
@@ -1073,8 +1404,19 @@ class MpvController:
             # network open and silently did nothing) we CONFIRM that the file
             # actually loaded and that the seek took effect. The user never saw
             # coarse alignment work; this loop is what makes it verifiable.
+            #
+            # THE RESULT IS NOW REPORTED, NOT DISCARDED (measured live
+            # 2026-10-08). The follower logs "已开始播放（起点 Ns）" from the
+            # value it REQUESTED, but a failed coarse seek leaves the picture at
+            # 0:00 -- so the log claimed success while the video sat ~29s behind
+            # the music (which the closed loop then classified as an anomaly).
+            # A silent failure here is indistinguishable from success in the
+            # log, so the caller must be able to see it (铁律 12).
             if start_sec and start_sec > 0.5:
-                self._seek_after_load(start_sec)
+                if not self._seek_after_load(start_sec):
+                    self._log_line(
+                        f"  · ⚠ 粗对齐 seek 未确认生效（请求 {start_sec:.1f}s）；"
+                        f"画面可能停在片头，闭环会纠正")
 
         # Pin the window rectangle. mpv re-centres (and sometimes resizes) the
         # window a few seconds AFTER the video starts loading, so a one-shot
@@ -1135,7 +1477,9 @@ class MpvController:
                 if enforce:
                     x, y, w, h = pinned
                     self.set_window_rect(x, y, w, h)
-                elif rect_on_screen(rect) and _is_plausible_user_resize(pinned, rect):
+                elif (rect_on_screen(rect)
+                      and _is_plausible_user_resize(pinned, rect)
+                      and self._within_cumulative_growth(rect)):
                     # User moved/resized it somewhere sane: adopt + persist.
                     self._remember_geometry(rect, measurable=False)
                 else:
@@ -1146,8 +1490,29 @@ class MpvController:
                     self.set_window_rect(x, y, w, h)
             time.sleep(interval)
 
+    def _within_cumulative_growth(self, rect: tuple[int, int, int, int]) -> bool:
+        """Whether `rect` is still within MAX_CUMULATIVE_GROWTH of the launch size.
+
+        Guards against mpv growing the window in steps that each look like a
+        plausible drag (see _is_plausible_user_resize). `self._launch_area` is
+        the size at start(); if it is unknown (e.g. a probe of an externally
+        started mpv) the check is skipped rather than guessed.
+        """
+        if not self._launch_area:
+            return True
+        area = float(rect[2] * rect[3])
+        return area <= MAX_CUMULATIVE_GROWTH * self._launch_area
+
     def _spawn_with_file(self, stream_url: str, start_sec: float, mute: bool) -> bool:
-        """Fallback: start a new process with the file on the command line."""
+        """Fallback: start a new process with the file on the command line.
+
+        Terminates any existing child first: this path is reached when the
+        command channel failed, and the caller has already called stop() -- but
+        stop() only clears `self.proc` when it could actually reap the process,
+        so a stubborn instance could otherwise stay on screen alongside the new
+        one (the "two windows" report, 2026-10-08).
+        """
+        self._terminate_proc()
         args = self._base_args()
         args = [a for a in args if not a.startswith("--mute") and not a.startswith("--volume")]
         args.append("--mute=yes" if mute else "--mute=no")

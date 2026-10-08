@@ -39,16 +39,40 @@ problem this project solves.
 - **Follow mode** — tracks whatever your player is playing, shows only the video
 - **Automatic alignment** — claims an absolute position by cross-correlating a
   short capture of your system audio against the video's own audio track
+- **Stays aligned** — a closed loop keeps re-checking the two clocks and nudges
+  the **playback speed** (±5%) to absorb drift, so the picture follows smoothly
+  instead of jumping. A genuine desync (e.g. a stale seek) is confirmed over two
+  samples and then resynchronised with one absolute seek
+- **Manual alignment** — nudge the picture with hotkeys in the video window
+  (`[` `]` = ∓0.1s, `{` `}` = ∓1s, `0` = reset) or with the small control window
+  (`python tools/align_control.py`). Your preference is kept **separate** from
+  the automatic error, so the loop never "corrects" your nudge away
+- **Remembers your preference across songs** — a calibration is stored at two
+  levels (this song → this player) and re-applied to later songs
 - **Refuses rather than guesses** — a wrong seek is worse than none, so weak or
   ambiguous correlations are rejected instead of applied
 - **Player whitelist** — only apps you list can drive it; anything else is
   denied (so a random video in a browser tab will not hijack your screen)
 - **Isolated playback** — its own mpv copy and config; your mpv/mpv.net setup is
   never read or modified
-- **Single window invariant** — songs switch inside one long-lived process
+- **Single window invariant** — songs switch inside one long-lived process, and a
+  leftover window is cleared before a new one is created
 - **Window position memory** — reopens where you left it, without stealing focus
 - **Self-test** — `python selftest.py` covers the maths, the capture path, the
   control channel and the isolation guarantees
+
+## Measuring sync quality
+
+Do not judge alignment from the log alone — measure it:
+
+```powershell
+python sync_probe.py --samples 12 --gap 3
+```
+
+It samples the music clock (SMTC) and the video clock repeatedly and reports the
+mean offset, the spread, and whether the residual is a constant bias, a real
+drift, or just noise. The reliability gate refuses to report numbers when the
+player's position is frozen or jumping.
 
 ## Quick start
 

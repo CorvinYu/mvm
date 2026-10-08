@@ -32,6 +32,7 @@ import sys
 import wave
 from ctypes import POINTER, byref, c_void_p, c_uint32, c_uint64, c_int, c_float, c_byte
 from ctypes.wintypes import DWORD, LPCWSTR, WORD
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------- COM plumbing ----------------
@@ -278,41 +279,91 @@ class LoopbackRecorder:
         }
 
 
-def record(path: Path, seconds: float = 12.0, target_rate: int = 16000) -> Path | None:
-    """Record system output to a mono 16-bit WAV at `target_rate`.
+@dataclass(frozen=True)
+class Recording:
+    """A finished loopback capture, with the WALL-CLOCK interval it covers.
 
-    Returns the path, or None if capture is unavailable.
+    WHY THIS TYPE EXISTS (2026-10-07, session 8)
+    --------------------------------------------
+    The old `record()` returned only a path, so callers had to ASSUME how much
+    audio it held -- follow.py used the nominal constant `ALIGN_CAPTURE_SEC`
+    (10.0s) in the absolute alignment formula
+
+        target = position_in_pv + ALIGN_CAPTURE_SEC + elapsed_after_capture
+
+    That assumption is wrong in two independent ways, and both shift the seek:
+
+      1. The record loop is bounded by a WALL-CLOCK deadline
+         (`deadline = time.time() + seconds`), so the number of samples that
+         actually arrive depends on scheduling, the audio engine's period and
+         how much the decoder/resampler gets to run. The captured audio is
+         therefore routinely a little SHORTER or LONGER than `seconds`.
+      2. `record()` keeps working AFTER the last sample was captured: the
+         decode + mono downmix + resample + WAV write (`_finalise_samples`)
+         take real time and produce NO audio. The previous code stamped
+         `t_end = time.monotonic()` only after `record()` RETURNED
+         (follow.py:707), so that tail was counted as "audio played here" and
+         the computed target was too far ahead.
+
+    So we now measure and return both facts instead of guessing:
+        * `covered_sec` -- the audio duration actually written to the file
+          (frames / rate). This is what the alignment formula must add.
+        * `t_audio_start` / `t_audio_end` -- monotonic timestamps bracketing the
+          live-audio window: start = just before the first chunk was pulled,
+          end   = when the last chunk arrived. `t_audio_end` is LATER than
+          `t_audio_start + covered_sec` only by the small sleep gaps between
+          empty reads; the decode/resample tail is excluded by construction.
+    """
+
+    path: Path
+    covered_sec: float
+    t_audio_start: float
+    t_audio_end: float
+    requested_sec: float
+    frames: int
+    sample_rate: int
+
+    def __fspath__(self) -> str:
+        """Behave like the Path the old API returned.
+
+        `record()` used to return a bare Path, and callers outside this task's
+        write scope (align_probe.py) still pass the result straight into
+        `wave.open()` / `ffprobe`-style helpers. Implementing os.PathLike keeps
+        those working unchanged while new callers get the timing facts.
+        `str(rec)` works too, so log lines that interpolate the result stay
+        readable.
+        """
+        return str(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    @property
+    def slack_sec(self) -> float:
+        """How far the nominal request was from what we really captured.
+
+        Positive = we captured MORE than asked. Diagnostics only; nothing in
+        the alignment math reads it, because the math no longer uses the
+        nominal value at all.
+        """
+        return self.covered_sec - self.requested_sec
+
+
+def _finalise_samples(raw: bytearray, info: dict, target_rate: int,
+                      t_audio_start: float, t_audio_end: float,
+                      requested_sec: float, path: Path) -> Recording | None:
+    """Decode/downmix/resample `raw` and write the mono WAV, then describe it.
+
+    Split out of `record()` so the timing fields are computed from the SAMPLE
+    COUNT (`raw`) and the audio-window timestamps -- never from the nominal
+    `seconds` argument. See the `Recording` docstring for why that matters.
     """
     import struct
-    import time
-
-    rec = LoopbackRecorder()
-    if not rec.open():
-        return None
-    info = rec.format_info()
-    if not rec.start():
-        rec.close()
-        return None
 
     rate = info.get("rate", 48000)
     channels = info.get("channels", 2)
     is_float = info.get("float", True)
     bits = info.get("bits", 32)
-
-    raw = bytearray()
-    deadline = time.time() + seconds
-    try:
-        while time.time() < deadline:
-            chunk = rec.read_chunk()
-            if chunk:
-                raw.extend(chunk)
-            else:
-                time.sleep(0.02)
-    finally:
-        rec.close()
-
-    if not raw:
-        return None
 
     # Decode to float mono.
     samples: list[float] = []
@@ -346,7 +397,66 @@ def record(path: Path, seconds: float = 12.0, target_rate: int = 16000) -> Path 
         w.writeframes(b"".join(
             struct.pack("<h", max(-32768, min(32767, int(s * 32767)))) for s in samples
         ))
-    return path
+
+    frames = len(samples)
+    return Recording(
+        path=path,
+        # The ONE number the alignment formula needs. Derived from frames, so
+        # it describes the file itself rather than our intention.
+        covered_sec=frames / rate if rate else 0.0,
+        t_audio_start=t_audio_start,
+        t_audio_end=t_audio_end,
+        requested_sec=requested_sec,
+        frames=frames,
+        sample_rate=rate,
+    )
+
+
+def record(path: Path, seconds: float = 12.0, target_rate: int = 16000) -> Recording | None:
+    """Record system output to a mono 16-bit WAV at `target_rate`.
+
+    Returns a `Recording` (path + the wall-clock interval the audio REALLY
+    covers), or None if capture is unavailable.
+
+    The timestamps are what makes fine alignment honest: the caller can compute
+    "how long ago did this audio play" from `t_audio_end` instead of assuming it
+    equals "when record() returned".
+    """
+    import time
+
+    rec = LoopbackRecorder()
+    if not rec.open():
+        return None
+    info = rec.format_info()
+    if not rec.start():
+        rec.close()
+        return None
+
+    raw = bytearray()
+    # Timestamps bracket the LIVE audio only. `t_audio_start` is taken just
+    # after the client started and before the first read, `t_audio_end` at the
+    # last iteration that produced samples -- so the decode/resample/write tail
+    # below is NOT inside [start, end] and cannot be mistaken for audio time.
+    t_audio_start = time.monotonic()
+    t_audio_end = t_audio_start
+    deadline = time.time() + seconds
+    try:
+        while time.time() < deadline:
+            chunk = rec.read_chunk()
+            if chunk:
+                raw.extend(chunk)
+                t_audio_end = time.monotonic()
+            else:
+                time.sleep(0.02)
+    finally:
+        rec.close()
+
+    if not raw:
+        return None
+
+    return _finalise_samples(
+        raw, info, target_rate, t_audio_start, t_audio_end, float(seconds), path
+    )
 
 
 if __name__ == "__main__":
