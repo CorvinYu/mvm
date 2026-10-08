@@ -988,6 +988,32 @@ def test_window_mode_contract() -> None:
           "elif _looks_like_mpv_self_resize(rect):" in p_src)
 
 
+def test_user_closed_window_contract() -> None:
+    """22. 用户关掉的窗口不得被反复唤起（issue #5）。
+
+    Behavioural proof: `src/test_user_closed_window.py` (15 criteria; `--old`
+    fails the reopen case). This is the always-on gate so the wiring cannot be
+    dropped by a later edit.
+    """
+    print("\n=== 22. 用户关窗不被反复唤起（issue #5）===")
+    f_src = (ROOT / "src" / "follow.py").read_text(encoding="utf-8")
+    check("存在 _notice_user_closed_window()", "_notice_user_closed_window" in f_src)
+    check("step() 每轮都检查窗口是否还在", "self._notice_user_closed_window()" in f_src)
+    check("初始化了 _window_was_up（区分“还在启动”与“被关掉”）",
+          "self._window_was_up = False" in f_src)
+    check("初始化了 _user_closed_key", "self._user_closed_key: TrackKey | None = None" in f_src)
+    check("暂停分支尊重“用户已关闭”", "if self._user_closed_key == self.current:" in f_src)
+    check("同曲分支不再重开", "if self._user_closed_key == key:" in f_src)
+    check("曲目重现时静默采纳而不重开（防“反复唤起”）",
+          "if self._user_closed_key == key and not self.player.running:" in f_src)
+    check("关闭事件写入 crash.log", 'crashlog.record("USER-CLOSED-WINDOW"' in f_src)
+    check("切换真正不同的曲目时清除标记（否则永远不再出画面）",
+          "self._user_closed_key = None" in f_src)
+    # The detection must be based on the PLAYER's liveness, not on SMTC.
+    check("判据来自 player.running（旧代码缺的就是它）",
+          "if self.player.running:" in f_src)
+
+
 def main() -> int:
     print("music-video-matcher 自检")
     print("=" * 60)
@@ -1012,6 +1038,7 @@ def main() -> int:
     test_lua_control_contract()
     test_crash_observability()
     test_window_mode_contract()
+    test_user_closed_window_contract()
 
     print("\n" + "=" * 60)
     total = _passed + _failed

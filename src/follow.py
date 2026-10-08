@@ -324,6 +324,15 @@ class Follower:
         # worker from starting the SAME song again (two windows) when SMTC
         # briefly drops the player during a track change.
         self._started_key: TrackKey | None = None
+        # ---------------- user-closed-window state (issue #5) ----------------
+        # True once we have OBSERVED our window up for the current track. Needed
+        # so a window that is merely still STARTING (player.running is briefly
+        # False during launch) is not mistaken for a closed one.
+        self._window_was_up = False
+        # Set when the window disappeared for a track that was playing. The
+        # daemon then leaves the window closed for THAT track instead of
+        # reopening it (the user's "关闭窗口后被反复唤起").
+        self._user_closed_key: TrackKey | None = None
         # When SMTC's position was last sampled (monotonic), so a sampled
         # position can be aged forward to "now".
         self._position_sampled_at: float = 0.0
@@ -1043,6 +1052,9 @@ class Follower:
     def step(self) -> None:
         """One poll iteration. Must return quickly -- never blocks on network."""
         sessions = read_sessions()
+        # issue #5: notice a window the user closed BEFORE deciding anything
+        # else, so the pause branch below does not "keep" a window that is gone.
+        self._notice_user_closed_window()
         session = pick_session(sessions, prefer_app=self.prefer_app)
 
         if session is None:
@@ -1067,6 +1079,11 @@ class Follower:
             # change". So a disappearing session only closes the window after a
             # confirmation period of several polls (NO_SESSION_GRACE_POLLS).
             if self.current is not None and self._current_still_listed(sessions):
+                # issue #5: if the user closed the window while paused, there is
+                # nothing to keep and nothing to freeze. Say so once and stop.
+                if self._user_closed_key == self.current:
+                    self._no_session_streak = 0
+                    return
                 if not self._video_paused:
                     self.log("音乐已暂停 -> 保留窗口（冻结画面）")
                     self._video_paused = True
@@ -1098,6 +1115,18 @@ class Follower:
         with self._lock:
             same = key == self.current
         if same:
+            # issue #5: the user closed our window for THIS track. Leave it
+            # closed -- no reopen, no alignment work, no manual-offset polling
+            # (there is no picture to nudge). The next track gets a fresh
+            # window, which is also how the user gets one back.
+            if self._user_closed_key == key:
+                if self.player.running:
+                    # A window exists again (the user restarted something, or a
+                    # later launch): drop the flag and resume normal behaviour.
+                    with self._lock:
+                        self._user_closed_key = None
+                else:
+                    return
             # Same song. If we had frozen the video for a pause, undo it: the
             # track is Playing again (otherwise pick_session would have
             # rejected it), so the picture must move again.
@@ -1124,6 +1153,19 @@ class Follower:
                 self._maybe_correct_drift(session, key)
             return  # same song, nothing else to do
 
+        # issue #5: the SAME track came back after the user closed its window.
+        # Players sometimes drop the SMTC session while paused (and re-add it on
+        # resume), which makes the track look brand new -- `self.current` was
+        # torn down in the meantime. Without this branch the "user closed it"
+        # decision is lost and the window is restored on the very next poll, so
+        # closing it is futile: exactly the "反复唤起" the user reported.
+        # Adopt the key silently (no switch) so later polls take the `same` path.
+        if self._user_closed_key == key and not self.player.running:
+            with self._lock:
+                self.current = key
+            self._no_session_streak = 0
+            return
+
         if self.current is not None:
             # Report what the loop achieved for the song that is ending, then
             # reset per-song state so the new song starts with a clean slate
@@ -1133,6 +1175,13 @@ class Follower:
         self.log(f"检测到切歌: {session.title} - {session.artist} "
                  f"({session.duration_sec:.0f}s) [{session.app_id}]")
         self._reset_loop_state(key)
+        # A DIFFERENT track gets a fresh window (issue #5): the "user closed it"
+        # decision belongs to the track it was made for. The same-key case was
+        # already handled above, so reaching here means this really is another
+        # track -- and this is how the user gets a window back at all.
+        with self._lock:
+            self._user_closed_key = None
+        self._window_was_up = False
         # Adopt the remembered manual preference BEFORE the video starts, so the
         # first seek already lands where the user wants it. Loading it later
         # would show as a visible jump once the corrector reacted.
@@ -1467,6 +1516,47 @@ class Follower:
         with self._lock:
             detected = self._detected_at
         return detected is not None and detected > since
+
+    def _notice_user_closed_window(self) -> None:
+        """Detect that the user closed our video window, and remember it (#5).
+
+        THE BUG (user report: "暂停后手动关闭窗口会被反复唤起")
+            Nothing ever consulted `player.running`. `_current_still_listed()`
+            only reads the SMTC session list -- which says nothing about our own
+            window. So after the user closed the window mid-pause, the daemon
+            still believed a picture was showing: `self.current` stayed set, the
+            pause branch kept "keeping the window", and the moment the music
+            resumed or the song changed, `play_url` hit
+            `if not self.running and not self.start()` and opened a NEW window.
+            Closing it again just repeated the loop.
+
+        WHY `_window_was_up` IS REQUIRED
+            `player.running` is False during the few seconds a launch takes. If
+            that counted as "the user closed it", every song would be marked
+            windowless during startup. So we only treat the disappearance as a
+            user action AFTER having observed the window up for this track.
+
+        mpv exiting on its own (a crash) is recorded the same way. Not reopening
+        for the rest of that track is the honest behaviour -- the user can see
+        the window is gone -- and `crash.log` (issue #6) now says why.
+        """
+        if self.player.running:
+            if self.current is not None:
+                self._window_was_up = True
+            return
+        if self.current is None or not self._window_was_up:
+            return
+        if self._user_closed_key != self.current:
+            self.log("视频窗口已关闭（判定为用户操作）-> 本曲不再自动重开")
+            crashlog.record("USER-CLOSED-WINDOW",
+                            f"  song={self.current.title!r} "
+                            f"artist={self.current.artist!r}")
+        with self._lock:
+            self._user_closed_key = self.current
+        # The window is gone, so a "frozen picture" no longer means anything and
+        # must not be reported as restored on resume.
+        self._window_was_up = False
+        self._video_paused = False
 
     def _current_still_listed(self, sessions: list[NowPlaying]) -> bool:
         """Whether the track we are showing is still present in any session.
