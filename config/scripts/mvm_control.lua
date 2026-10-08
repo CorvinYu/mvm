@@ -13,6 +13,19 @@
 --   So we poll a plain command file instead. It needs no pipes and no sockets.
 
 local cmd_file = os.getenv("MVM_CMD_FILE") or "mvm_cmd.txt"
+-- Window mode, published to its OWN file via atomic rename (issue #2).
+--
+-- WHY NOT IN THE STATUS FILE (measured 2026-10-08, twice):
+--   The status file is rewritten every 0.5s with a plain truncating write, so a
+--   reader can catch it EMPTY or PARTIAL. When the geometry guard read such a
+--   tick it concluded "not fullscreen" and yanked a deliberate fullscreen back.
+--   Caching the last good value reduced this to an occasional failure but did
+--   NOT remove it: right after the user enters fullscreen the cache still holds
+--   the older "no", so a truncated read returns the WRONG answer.
+--   `os.rename` is atomic, so a reader of THIS file never sees a half write --
+--   the same technique already used for the manual-offset sidecar below.
+local mode_file = os.getenv("MVM_MODE_FILE")
+local mode_tmp = os.getenv("MVM_MODE_TMP")
 -- Who owns this mpv (issue #6): the Python follower. If it dies for ANY reason
 -- (crash, hard kill, sandbox teardown), the Lua timer below notices and quits,
 -- so an orphan window cannot outlive its daemon. Only active when the variable
@@ -166,22 +179,63 @@ local manual_dirty  = false     -- force a status write right after a nudge
 --
 -- Written via rename() to be atomic: mpv and the daemon are different
 -- processes and a torn read would make the daemon record a half value.
+--
+-- ★ os.remove() FIRST -- THIS WAS A REAL BUG (measured 2026-10-08)
+--   On Windows `rename()` FAILS when the destination already exists (verified
+--   from Python: FileExistsError; Lua's os.rename is the same C call). The
+--   target is only removed when a new mpv spawns, so the FIRST nudge wrote
+--   0.100 and every later nudge silently failed:
+--       nudge +0.1 -> 0.100   (rename created the file)
+--       nudge +0.1 -> 0.100   (target exists -> rename fails, retry also fails)
+--       nudge -0.5 -> 0.100   (stuck forever)
+--   The daemon therefore read a FROZEN manual offset: every manual adjustment
+--   after the first was dropped. That matches the user's issue #3 report
+--   ("手动调整对齐似乎没有生效") far better than a key-binding problem, and it
+--   silently broke the manual channel that #4 and #5 depend on.
+--   The old comment blamed "a reader holding the target open" -- the retry it
+--   justified could never help, because the cause was the existing target.
 local function publish_manual_sidecar()
     if not (manual_file and manual_tmp) then return end
     local w = io.open(manual_tmp, "w")
     if not w then return end
     w:write(string.format("%.3f\n", manual_offset))
     w:close()
+    os.remove(manual_file)
     local ok = os.rename(manual_tmp, manual_file)
     if not ok then
-        -- On Windows the rename can lose a race with a reader holding the
-        -- target open. Retry once: the value is the user's keypress, so it is
-        -- worth one retry rather than dropping it silently.
+        -- A concurrent reader can still hold the target open for an instant;
+        -- one retry covers that. (It cannot cover an existing target, which is
+        -- why os.remove above is essential.)
+        os.remove(manual_file)
         ok = os.rename(manual_tmp, manual_file)
         if not ok then
             log("manual sidecar rename failed (value kept in status file)")
         end
     end
+end
+
+-- Atomic publish of (fullscreen, maximized) to its OWN file.
+-- Readers never observe a partial write, which is what the geometry guard
+-- needs: it must never mistake "I caught the writer mid-truncate" for "the user
+-- is not in fullscreen" -- that mistake yanks the window out of fullscreen.
+local function publish_mode()
+    if not (mode_file and mode_tmp) then return end
+    local f = io.open(mode_tmp, "w")
+    if not f then return end
+    local fullscreen = mp.get_property("fullscreen")
+    local maximized = mp.get_property("window-maximized")
+    f:write((fullscreen or "no") .. "\n" .. (maximized or "no") .. "\n")
+    f:close()
+    -- os.remove FIRST. Measured 2026-10-08: on Windows `rename()` FAILS when the
+    -- destination already exists, so without this the very first write succeeded
+    -- and every later one silently failed -- the mode file stayed stuck at its
+    -- first value (observed: "yes" forever after the user left fullscreen, which
+    -- left the guard permanently believing a fullscreen was active).
+    -- A reader that hits the brief gap falls back to the cached/legacy value,
+    -- which is the previous mode -- correct except across an actual change, and
+    -- the 0.5s cadence makes that window vanishingly small.
+    os.remove(mode_file)
+    os.rename(mode_tmp, mode_file)
 end
 
 local function write_status()
@@ -199,8 +253,10 @@ local function write_status()
 
     local f = io.open(status_file, "w")
     if f then
-        -- Lines 6-7 let the geometry guard honour a DELIBERATE fullscreen /
-        -- maximize instead of undoing it (issue #2).
+        -- Lines 6-7 are kept for compatibility, but the geometry guard reads
+        -- the ATOMIC mode file instead (see the note at the top): this file's
+        -- truncating write is exactly what made a fullscreen look "not
+        -- fullscreen" for one tick.
         local fullscreen = mp.get_property("fullscreen") or "no"
         local maximized = mp.get_property("window-maximized") or "no"
         f:write(string.format("%s\n%s\n%s\n%s\n%.3f\n%s\n%s\n",
@@ -213,6 +269,8 @@ local function write_status()
             maximized))
         f:close()
     end
+
+    publish_mode()
 end
 
 local function nudge(delta)

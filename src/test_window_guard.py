@@ -74,12 +74,20 @@ def _status(values: dict) -> Path:
         f"{maximized}\n",   # 7 window-maximized
         encoding="utf-8",
     )
-    # ALSO repoint the module-level path. Writing the file alone is not enough:
-    # `read_window_mode()` reads `player.STATUS_FILE`, so without this the guard
-    # kept reading the real (stale, 5-line) status file and answered "not
-    # fullscreen" -- which made §1 fail in FIXED mode and was indistinguishable
-    # from a product bug. Same class of mistake as NOTES §3.2: a check that does
-    # not exercise the real path proves nothing.
+    # ALSO repoint the module-level paths. Writing the file alone is not enough:
+    # `read_window_mode()` reads `player.MODE_FILE` / `player.STATUS_FILE`, so
+    # without this the guard kept reading the real (stale, 5-line) status file
+    # and answered "not fullscreen" -- which made §1 fail in FIXED mode and was
+    # indistinguishable from a product bug. Same class of mistake as NOTES §3.2:
+    # a check that does not exercise the real path proves nothing.
+    #
+    # The ATOMIC mode file is the primary source, so the helper must produce it
+    # too -- otherwise the tests would silently exercise only the legacy
+    # fallback and never cover the path production actually uses.
+    mode_path = SCRATCH / "_mvm_window_mode.txt"
+    mode_path.write_text(f"{fullscreen}\n{maximized}\n", encoding="utf-8")
+    player.MODE_FILE = mode_path
+    player.MODE_TMP = SCRATCH / "_mvm_window_mode.tmp"
     player.STATUS_FILE = path
     return path
 
@@ -158,10 +166,17 @@ wx, wy, ww, wh = player.work_area()
 print(f"work_area = {ww}x{wh}\n")
 
 PINNED = (953, 500, 655, 397)                    # the normal small window
-SCREEN_RECT = (0, 0, ww, wh)                     # what fullscreen looks like
-MAX_RECT = (0, 0, ww, wh - 40)                   # maximized (title-bar-less area)
-BIG_USER = (900, 300, 900, 700)                  # big, but < 70% of the work area
-RUNAWAY = (3181, 1377, 655, 397)                 # measured off-screen jump
+SCREEN_RECT = (wx, wy, ww, wh)                   # what fullscreen looks like
+MAX_RECT = (wx, wy, ww, wh - 40)                 # maximized (title-bar-less area)
+BIG_USER = (wx + 40, wy + 40, 1000, 700)         # big, deliberate, but not near-fullscreen
+# DERIVED, not hard-coded. WHY (measured 2026-10-08): this used to be the literal
+# (3181,1377,655,397) recorded on the machine where the bug was found. When
+# `work_area()` later reported 3840x2088 instead of 1920x1032 (display
+# scaling/resolution changed), that rectangle became genuinely ON-screen, so the
+# guard correctly adopted it and the "runaway geometry is undone" criterion
+# failed -- a TEST failure that looked exactly like a product regression. The
+# coordinates must be expressed relative to whatever the current work area is.
+RUNAWAY = (wx + ww + 300, wy + wh + 300, 655, 397)     # fully off-screen
 SELF_RESIZE = (wx, wy, int(ww * 0.9), int(wh * 0.9))   # mpv's own near-fullscreen
 
 # --------------------------------------------------------------------------
@@ -190,9 +205,20 @@ print("§2 用户把窗口调大（非全屏、未越界）→ 留在原处，�
 ctl = FakeCtl([BIG_USER], PINNED, launch_area=655 * 397,
               mode=("no", "no"))
 run_guard(ctl)
+# Assert ALL the preconditions this branch depends on. If any stops holding (a
+# different resolution, changed constants) the case would silently become
+# vacuous -- it would "pass" without exercising the branch it exists for.
 implausible = not player._is_plausible_user_resize(PINNED, BIG_USER)
-check("前提：该尺寸确实超出保守的“像用户拖拽”判据", implausible,
-      f"area={BIG_USER[2] * BIG_USER[3]} pinned_area={PINNED[2] * PINNED[3]}")
+not_self_resize = not player._looks_like_mpv_self_resize(BIG_USER)
+on_screen = player.rect_on_screen(BIG_USER)
+beyond_growth = not ctl._within_cumulative_growth(BIG_USER)
+check("前提1：超出“像用户拖拽”判据（否则会走采纳分支）", implausible,
+      f"area={BIG_USER[2] * BIG_USER[3]} > 1.5*pinned={1.5 * PINNED[2] * PINNED[3]:.0f}")
+check("前提2：不是 mpv 自放大签名（否则会被拉回）", not_self_resize,
+      f"area={BIG_USER[2] * BIG_USER[3]} <= 0.7*work={0.7 * ww * wh:.0f}")
+check("前提3：超出累计增长上限（否则会被采纳）", beyond_growth,
+      f"area={BIG_USER[2] * BIG_USER[3]} > 2*launch={2 * 655 * 397}")
+check("前提4：仍在屏幕内（否则会被当越界拉回）", on_screen, f"rect={BIG_USER}")
 check("用户调大的窗口没有被拉回（修复“无法调整位置”）", not ctl.snaps,
       f"snaps={ctl.snaps}")
 check("未把不确定的尺寸写进 window.json", not ctl.adopted, f"adopted={ctl.adopted}")
@@ -219,48 +245,52 @@ check("同尺寸移动被采纳（未误伤）", ctl.adopted == [MOVED] and not 
       f"adopted={ctl.adopted} snaps={ctl.snaps}")
 
 # --------------------------------------------------------------------------
-print("§4 模式不可用时的保守行为（旧 lua / 文件截断）")
+print("§4 两个来源都不可用时的保守行为（守卫必须保持启用）")
 # --------------------------------------------------------------------------
 SCRATCH.mkdir(parents=True, exist_ok=True)
 short = SCRATCH / "_mvm_status.txt"
 short.write_text("12.5\nno\nC:/x.mp4\nhas-window\n0.000\n", encoding="utf-8")
 player.STATUS_FILE = short
+player.MODE_FILE = SCRATCH / "_no_mode_file.txt"      # the atomic file is absent
 player.reset_window_mode_cache()
-check("只有 5 行且无历史值时 read_window_mode 返回 (False, False)（守卫保持启用）",
+check("模式文件缺失 + 状态文件只有 5 行 + 无历史值 -> (False, False)",
       player.read_window_mode() == (False, False),
       f"{player.read_window_mode()}")
-missing = SCRATCH / "_does_not_exist.txt"
-player.STATUS_FILE = missing
-check("状态文件缺失且无历史值时返回 (False, False)",
+player.STATUS_FILE = SCRATCH / "_does_not_exist.txt"
+check("两个文件都不存在且无历史值时返回 (False, False)（守卫保持启用）",
       player.read_window_mode() == (False, False))
 
 # --------------------------------------------------------------------------
-print("\n§5 截断写竞态：读到半截文件必须回退到上次已知值")
+print("\n§5 ★ 状态文件被截断时，答案必须不变（这就是把模式挪进原子文件的理由）")
 # --------------------------------------------------------------------------
-# WHY THIS CASE EXISTS (measured 2026-10-08): mvm_control.lua rewrites the
-# status file with a plain truncating write every 0.5s, so a reader can catch it
-# EMPTY or PARTIAL. Running the live fullscreen probe three times, the third run
-# had its window yanked OUT of fullscreen again: on one tick the guard read a
-# truncated file, concluded "not fullscreen", and its ENFORCE branch (active for
-# ~12s after a launch) snapped the window back. Caching the last good reading
-# fixes it -- and this case must FAIL if that cache is removed.
+# WHY THIS CASE IS THE POINT OF THE FIX (measured 2026-10-08, twice):
+#   mvm_control.lua rewrites the status file with a plain truncating write every
+#   0.5s. Two live-probe runs lost a fullscreen to it: the guard caught a torn
+#   read, concluded "not fullscreen", and its ENFORCE branch (active ~12s after a
+#   launch) snapped the window back. Caching the last good value only NARROWED
+#   the window -- right after entering fullscreen the cache still held the older
+#   "no", so a torn read returned the wrong answer anyway.
+#   The mode now lives in its own file published via os.rename, which is atomic,
+#   so the status file's races simply cannot affect this decision.
 good = _status({"fullscreen": "yes", "maximized": "no"})
 player.reset_window_mode_cache()
-check("完整文件被正确解析为 (True, False)", player.read_window_mode() == (True, False),
+check("原子模式文件被解析为 (True, False)", player.read_window_mode() == (True, False),
       f"{player.read_window_mode()}")
 
-good.write_text("", encoding="utf-8")          # caught mid-truncate
-check("文件被截断为空时回退到上次已知值 (True, False)（否则全屏会被拉回）",
+good.write_text("", encoding="utf-8")            # status file caught mid-truncate
+check("状态文件被截断为空时答案仍为 (True, False)  ★ 核心",
       player.read_window_mode() == (True, False),
       f"{player.read_window_mode()}")
 
-good.write_text("12.5\nno\n", encoding="utf-8")  # partial write
-check("文件只写了一半时仍回退到上次已知值",
+good.write_text("12.5\nno\n", encoding="utf-8")  # status file half written
+check("状态文件只写了一半时答案仍为 (True, False)",
       player.read_window_mode() == (True, False),
       f"{player.read_window_mode()}")
 
-player.STATUS_FILE = SCRATCH / "_nope.txt"
-check("文件消失时仍回退到上次已知值",
+# Now the atomic file also disappears (e.g. mpv just exited): the legacy status
+# source + the cache must keep the answer sane rather than invent "not fullscreen".
+player.MODE_FILE = SCRATCH / "_gone_mode.txt"
+check("模式文件消失时回退到上次已知值 (True, False)",
       player.read_window_mode() == (True, False),
       f"{player.read_window_mode()}")
 

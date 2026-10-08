@@ -80,6 +80,12 @@ STATUS_FILE = STATE_DIR / "_mvm_status.txt"
 MANUAL_FILE = STATE_DIR / "_mvm_hotkey_offset.txt"
 MANUAL_TMP = STATE_DIR / "_mvm_hotkey_offset.tmp"
 
+# Window mode (fullscreen / maximized), published ATOMICALLY by the Lua script
+# so the geometry guard can never lose a fullscreen to a torn read (issue #2).
+# The temp file is what Lua writes first; the rename onto MODE_FILE is atomic.
+MODE_FILE = STATE_DIR / "_mvm_window_mode.txt"
+MODE_TMP = STATE_DIR / "_mvm_window_mode.tmp"
+
 # How long to wait for a freshly spawned mpv to become usable.
 #
 # Measured 2026-10-08: a small window (~982x596) is ready in ~1.5s, but a large
@@ -328,16 +334,32 @@ def read_window_mode() -> tuple[bool, bool]:
         missing flag must not silently disable window management.
     """
     global _last_window_mode
+
+    # PREFERRED: the dedicated atomic mode file. `mvm_control.lua` writes it with
+    # write-temp-then-rename, so a reader can NEVER observe a partial value --
+    # which is what made the shared status file unusable for this decision
+    # (catching its truncating write made a fullscreen look "not fullscreen" and
+    # the guard yanked the window back; caching only narrowed the window, because
+    # right after entering fullscreen the cache still held the older "no").
+    try:
+        if MODE_FILE.exists():
+            parts = MODE_FILE.read_text(encoding="utf-8").splitlines()
+            if len(parts) >= 2:
+                mode = (parts[0].strip().lower() == "yes",
+                        parts[1].strip().lower() == "yes")
+                _last_window_mode = mode
+                return mode
+    except OSError:
+        pass
+
+    # FALLBACK: lines 6-7 of the status file, for an older control script. This
+    # path IS racy, which is why it is no longer the primary source.
     try:
         lines = STATUS_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
         return _last_window_mode or (False, False)
-
-    # Lines 1-7 must all be present; a short file means we caught the writer
-    # mid-truncate, not that the mode is false.
     if len(lines) < 7:
         return _last_window_mode or (False, False)
-
     mode = (lines[5].strip().lower() == "yes", lines[6].strip().lower() == "yes")
     _last_window_mode = mode
     return mode
@@ -1065,6 +1087,11 @@ class MpvController:
                 CMD_FILE.write_text("", encoding="utf-8")
                 if STATUS_FILE.exists():
                     STATUS_FILE.unlink()
+                # A stale mode file from a previous run would make the new window
+                # look like it is fullscreen (issue #2).
+                for stale in (MODE_FILE, MODE_TMP):
+                    if stale.exists():
+                        stale.unlink()
                 # The manual-offset sidecar belongs to a previous mpv run: a new
                 # run starts with no manual offset, so leaving the old value
                 # would make the follower record a nudge the user never made in
@@ -1080,6 +1107,9 @@ class MpvController:
             # Hand the manual-offset sidecar paths to the Lua hotkeys (task-2).
             env["MVM_MANUAL_FILE"] = str(MANUAL_FILE)
             env["MVM_MANUAL_TMP"] = str(MANUAL_TMP)
+            # Atomic window-mode channel (issue #2).
+            env["MVM_MODE_FILE"] = str(MODE_FILE)
+            env["MVM_MODE_TMP"] = str(MODE_TMP)
             # Tell mpv which Python process owns it, so the Lua side can quit
             # when that process dies (issue #6). Compares launcher PIDs rather
             # than recording the child's parent pid: the launcher may itself be
