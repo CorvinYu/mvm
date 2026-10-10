@@ -1437,7 +1437,17 @@ class Follower:
             return
 
         self.current_candidate = best
-        self.log(f"  ✓ 已开始播放（起点 {start_sec:.1f}s，依据: {rough_source}）")
+        # Report the coarse seek HONESTLY (measured 2026-10-10). This line used
+        # to print the REQUESTED start unconditionally, so a coarse seek that
+        # never took effect still looked like success -- the user reported
+        # "第一次切歌后直接从 0 开始播放，粗对齐没有生效" while the log said
+        # "✓ 已开始播放（起点 11.8s）". `play_url` now verifies the seek against
+        # the status of the media it actually loaded and exposes the verdict.
+        if getattr(self.player, "last_seek_verified", None) is False:
+            self.log(f"  ⚠ 已开始播放，但起点未获确认（请求 {start_sec:.1f}s）"
+                     f"—— 画面可能在片头，等待互相关校正")
+        else:
+            self.log(f"  ✓ 已开始播放（起点 {start_sec:.1f}s，依据: {rough_source}）")
 
         # A5: record how long this switch took, so the next song can start
         # closer. `platform` comes from the selected candidate.

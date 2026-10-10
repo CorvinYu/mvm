@@ -273,6 +273,27 @@ local function write_status()
     publish_mode()
 end
 
+-- On-screen readout for the manual-alignment keys (added 2026-10-10).
+--
+-- WHY THIS EXISTS (user report): "似乎不太好用，在屏幕上没有明确的显示示意" --
+-- the keys DID work (issue #3's real cause was Windows `rename()` refusing to
+-- overwrite the sidecar, so every nudge after the first was silently dropped),
+-- but nothing on screen said whether the key had been received or what the
+-- offset now was. That matters more than usual here because mpv's OWN default
+-- bindings for `[`/`]`/`{`/`}`/`0` are speed/volume, so without a readout the
+-- user cannot tell which binding actually ran -- they may reasonably conclude
+-- the feature is broken.
+--
+-- This adds ONLY a visible readout. No key changes, no behaviour change: the
+-- seek, the sidecar publish and the status write are untouched.
+--
+-- The sign is always explicit ("+0.30s") so the direction is unambiguous and
+-- matches follow.log's "+offset" language (positive = picture moved later).
+local function show_offset(prefix)
+    local sign = manual_offset >= 0 and "+" or ""
+    mp.osd_message(string.format("%s %s%.2fs", prefix, sign, manual_offset), 2)
+end
+
 local function nudge(delta)
     local path = mp.get_property("path") or ""
     if manual_track ~= path then
@@ -292,6 +313,9 @@ local function nudge(delta)
     -- happened -- process liveness proves nothing).
     log(string.format("manual nudge %+.3fs -> cumulative %+.3fs", delta,
                       manual_offset))
+    -- Show the running total, not just this step: "did my press register, and
+    -- where am I now?" are the two questions the user actually has.
+    show_offset(string.format("对齐微调 %+.2fs → 累计", delta))
     manual_dirty = true
     publish_manual_sidecar()
     write_status()
@@ -304,6 +328,7 @@ local function reset_manual()
     local was = manual_offset
     manual_offset = 0.0
     log(string.format("manual reset (was %+.3fs)", was))
+    show_offset(string.format("对齐已重置（原 %+.2fs）→ 累计", was))
     manual_dirty = true
     publish_manual_sidecar()
     write_status()

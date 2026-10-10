@@ -243,6 +243,21 @@ if _WIN:                                    # pragma: no cover - Windows only
                                                  ctypes.POINTER(ctypes.c_ulong)]
     _ENUM_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
     _user32.EnumWindows.argtypes = [_ENUM_PROC, _wt.LPARAM]
+    # For `user_is_dragging()` -- see below.
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
+    # Multi-monitor enumeration (see all_monitor_rects). MONITORENUMPROC takes
+    # (HMONITOR, HDC, LPRECT, LPARAM); the rect is a POINTER to a RECT shared by
+    # the API, never ours to free.
+    _MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                          ctypes.c_void_p,
+                                          ctypes.POINTER(_RECT),
+                                          ctypes.c_double)
+    _user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            _MONITORENUMPROC, ctypes.c_double]
+    _user32.EnumDisplayMonitors.restype = _wt.BOOL
+    _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _user32.GetMonitorInfoW.restype = _wt.BOOL
 
     _DPI_AWARE_V2 = -4          # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
     _SPI_GETWORKAREA = 0x0030
@@ -263,6 +278,42 @@ def _dpi_aware() -> None:
         _user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(_DPI_AWARE_V2))
     except (AttributeError, OSError):
         pass        # pre-1703 Windows: keep virtualised coordinates
+
+
+# Virtual-key code for the left mouse button.
+VK_LBUTTON = 0x01
+
+
+def user_is_dragging() -> bool:
+    """Whether the left mouse button is currently held down.
+
+    WHY (measured 2026-10-10; user report "在主屏幕内无法移动，松手后立刻跳回原位"):
+        For GUARD_SETTLE_SECONDS (12s) after every loadfile/start the guard
+        ENFORCES the pinned rectangle, because mpv re-centres itself in that
+        window of time and a moved window is assumed to be mpv's doing. A user
+        who grabs the window during those 12 seconds therefore fights the guard
+        and the window snaps back the instant they let go (reproduced in
+        src/probe_guard_resize.py §1: the guard called set_window_rect once while
+        the window was moved by hand). The behaviour is by design, but its timing
+        is unpredictable from the user's side, which is what makes it feel like
+        "the window cannot be moved".
+
+    A held left button is the one signal that unambiguously means "a human is
+    manipulating a window right now", so the guard stands down while it is
+    pressed. It is deliberately NOT tied to a particular window: we cannot know
+    which window the user is dragging, only that they are dragging something,
+    and standing down for the duration costs nothing (the next poll after the
+    button is released resumes normal handling and adopts the new rectangle).
+
+    Fails closed to False (guard behaves exactly as before) if the call is
+    unavailable, so this can never silently disable the guard.
+    """
+    if not _WIN:
+        return False
+    try:
+        return bool(_user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+    except (AttributeError, OSError):
+        return False
 
 
 def work_area() -> tuple[int, int, int, int]:
@@ -380,18 +431,36 @@ def reset_window_mode_cache() -> None:
     _last_window_mode = None
 
 
+def _largest_monitor_area() -> float:
+    """Area of the biggest monitor, in px^2 (0.0 when unknown).
+
+    Used as the denominator for the "is this window eating the screen?" tests.
+    The PRIMARY monitor was used before, which under-states the threshold on a
+    setup where the user's larger screen is not the primary one: a window the
+    user legitimately sized to fill that bigger screen could then look like mpv
+    self-enlargement. Taking the maximum keeps the test conservative (it only
+    ever becomes MORE permissive where a bigger screen really exists).
+    """
+    areas = [float(w * h) for _x, _y, w, h in all_monitor_rects() if w > 0 and h > 0]
+    return max(areas) if areas else 0.0
+
+
 def _looks_like_mpv_self_resize(rect: tuple[int, int, int, int]) -> bool:
     """Whether an on-screen change carries mpv's self-enlargement signature.
 
     Used only AFTER mpv has told us it is neither fullscreen nor maximized (see
     `read_window_mode`): at that point a near-fullscreen rectangle is mpv having
     grown itself, which is worth undoing (the "窗口变得很大/挡住屏幕" bug).
+
+    The threshold is measured against the LARGEST monitor, not the primary one
+    (see `_largest_monitor_area`), so a window that legitimately fills a larger
+    secondary screen is not mistaken for mpv's own growth.
     """
     _x, _y, w, h = rect
-    wx, wy, ww, wh = work_area()
-    if w <= 0 or h <= 0 or ww <= 0 or wh <= 0:
+    biggest = _largest_monitor_area()
+    if w <= 0 or h <= 0 or biggest <= 0.0:
         return False
-    return float(w * h) > NEAR_FULLSCREEN_WORK_AREA_FRACTION * float(ww * wh)
+    return float(w * h) > NEAR_FULLSCREEN_WORK_AREA_FRACTION * biggest
 
 
 def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
@@ -426,10 +495,9 @@ def _is_plausible_user_resize(pinned: tuple[int, int, int, int],
     x, y, w, h = rect
     if pw <= 0 or ph <= 0 or w <= 0 or h <= 0:
         return False
-    wx, wy, ww, wh = work_area()
-    work_area_px = float(ww * wh) or 1.0
+    biggest = _largest_monitor_area() or 1.0
     area = float(w * h)
-    if area > NEAR_FULLSCREEN_WORK_AREA_FRACTION * work_area_px:
+    if area > NEAR_FULLSCREEN_WORK_AREA_FRACTION * biggest:
         return False                      # near-fullscreen: mpv's own doing
     if area > 1.5 * float(pw * ph):
         return False                      # sudden big growth: not a drag
@@ -452,17 +520,153 @@ MAX_CUMULATIVE_GROWTH = 2.0
 MIN_WINDOW_SIZE_PX = (320, 240)
 
 
-def rect_on_screen(rect: tuple[int, int, int, int]) -> bool:
-    """True when `rect` fits entirely inside the primary work area.
+def all_monitor_rects() -> list[tuple[int, int, int, int]]:
+    """Every monitor's rect (x, y, w, h) in PHYSICAL pixels, virtual-desktop order.
 
-    Used to refuse remembering a runaway position: mpv has been measured
-    jumping to 3181,1377 / 3285,1428, which hangs off this screen's edge.
-    (Multi-monitor is out of scope -- only the primary work area is considered.)
+    WHY THIS EXISTS (measured 2026-10-10, user report "跨屏幕移动失败"):
+        Windows lays multiple monitors out on one VIRTUAL DESKTOP whose origin is
+        NOT necessarily (0,0) -- a secondary monitor placed left of / above the
+        primary has NEGATIVE coordinates. The host used for this fix has
+        primary 3840x2160 @(0,0) and a 1600x2560 secondary @(-1600,-108).
+
+        `work_area()` returns only the PRIMARY monitor, so any rectangle on the
+        secondary fails `rect_on_screen()` and the guard treats a perfectly good
+        user drag as "runaway geometry" and yanks the window back. The user saw
+        exactly that: "跨屏幕移动失败".
+
+    Falls back to a single primary-monitor entry when EnumDisplayMonitors is
+    unavailable, so a callers' behaviour degrades to the old single-screen
+    semantics rather than to "nothing is on screen".
+    """
+    if not _WIN:
+        return [work_area()]
+    _dpi_aware()
+    found: list[tuple[int, int, int, int]] = []
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", _wt.DWORD),
+                    ("rcMonitor", _RECT),
+                    ("rcWork", _RECT),
+                    ("dwFlags", _wt.DWORD)]
+
+    enum_proc = _MONITORENUMPROC
+
+    def _cb(_hmon, _hdc, _lprc, _data):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        try:
+            if _user32.GetMonitorInfoW(_hmon, ctypes.byref(info)):
+                r = info.rcMonitor
+                w, h = r.right - r.left, r.bottom - r.top
+                if w > 0 and h > 0:
+                    found.append((r.left, r.top, w, h))
+        except OSError:
+            pass
+        return True
+
+    try:
+        if _user32.EnumDisplayMonitors(None, None, enum_proc(_cb), 0.0):
+            pass
+    except (AttributeError, OSError):
+        pass
+    return found or [work_area()]
+
+
+def rect_overlap_fraction(rect: tuple[int, int, int, int]) -> float:
+    """Fraction of `rect`'s area that lies inside the union of all monitors.
+
+    1.0 = entirely on screen; 0.0 = entirely outside.
     """
     x, y, w, h = rect
-    wx, wy, ww, wh = work_area()
-    return (w > 0 and h > 0 and x >= wx and y >= wy
-            and x + w <= wx + ww and y + h <= wy + wh)
+    if w <= 0 or h <= 0:
+        return 0.0
+    area = float(w * h)
+    covered = 0.0
+    for mx, my, mw, mh in all_monitor_rects():
+        if mw <= 0 or mh <= 0:
+            continue
+        ix = max(0, min(x + w, mx + mw) - max(x, mx))
+        iy = max(0, min(y + h, my + mh) - max(y, my))
+        covered += float(ix * iy)
+    return min(1.0, covered / area)
+
+
+# How much of a window must be on screen for the guard to treat it as reachable.
+# WHY 50% AND NOT "entirely inside one monitor" (measured 2026-10-10):
+#   The old test demanded the rectangle fit WHOLLY inside a single monitor, and
+#   the user reported that "靠边自动改变窗口大小…依然会跳回原来的样子". The probe
+#   (src/probe_guard_resize.py §2d) reproduced it: a window deliberately spanning
+#   the seam -- (-800,300,1600,900) across a 3840-wide primary and a secondary
+#   starting at x=-1600 -- overlaps BOTH monitors completely, yet fits inside
+#   NEITHER, so it was classified as runaway geometry and yanked back. Snapping
+#   on the 1600-wide secondary produces exactly such a rectangle, because the
+#   snapped size exceeds that monitor.
+#   Windows genuinely allows windows to straddle monitors (any drag across the
+#   seam does it), so "wholly inside one monitor" is the wrong question. The
+#   property that actually matters is "can the user still see and grab it?".
+#   Measured against the runaway geometry this guard exists to stop:
+#     (3181,1377,982,596)   -> 67% on screen -> tolerated (mostly visible; the
+#                              "mpv enlarged itself" protection still applies)
+#     (3285,1428,1414,1102) -> 26% on screen -> still rejected
+ON_SCREEN_MIN_OVERLAP_FRACTION = 0.50
+
+# While a human is dragging, we adopt whatever they produce -- but not a window
+# dragged so far off the desktop that they could no longer grab it again. This
+# is a much lower bar than ON_SCREEN_MIN_OVERLAP_FRACTION because the user is
+# actively steering: a sliver on screen is enough for them to keep dragging,
+# whereas the automatic paths above must be conservative.
+DRAG_MIN_ON_SCREEN_FRACTION = 0.10
+
+
+def rect_on_screen(rect: tuple[int, int, int, int]) -> bool:
+    """True when `rect` is mostly on screen (see ON_SCREEN_MIN_OVERLAP_FRACTION).
+
+    Used to refuse remembering a runaway position: mpv has been measured
+    jumping to 3181,1377 / 3285,1428, which hang off the desktop's edge.
+
+    HISTORY (both changes measured on this machine):
+      * It originally compared against the PRIMARY work area only, so anything
+        on a secondary monitor was rejected -- the "跨屏幕移动失败" report.
+      * It then required the rect to fit wholly inside SOME monitor, which still
+        rejected legitimate cross-monitor windows (see the constant's comment).
+      * It now measures how much of the window is actually on a monitor, which
+        answers the question the guard is really asking.
+    """
+    return rect_overlap_fraction(rect) >= ON_SCREEN_MIN_OVERLAP_FRACTION
+
+
+def status_path_basename(path_field: str) -> str:
+    """Comparable identity of a media path/URL from the status file's line 3.
+
+    Used to answer "is the media mpv is playing the one I just asked for?".
+
+    WHY NOT A RAW STRING COMPARISON: a bilibili DASH URL carries a long signed
+    query string (`...m4s?e=...&deadline=...&upsig=...`), and mpv may normalise
+    separators or drop parts of it when it reports `path` back. Comparing only
+    the basename without the query is stable across those differences while
+    still being specific: a measured URL's basename looked like
+    `<numeric-id>-1-<quality>.m4s`, which identifies the stream.
+    """
+    if not path_field:
+        return ""
+    p = path_field.split("?", 1)[0].split("#", 1)[0]
+    p = p.replace("\\", "/").rstrip("/")
+    return p.rsplit("/", 1)[-1].lower()
+
+
+def paths_refer_to_same_media(requested: str, reported: str) -> bool:
+    """Whether `reported` (from the status file) is the media we asked for.
+
+    Tolerant on purpose (see `status_path_basename`): equal basenames, or one
+    containing the other, both count. A `reported` value that is empty is NOT a
+    match -- an unreported path proves nothing, and treating it as a match is
+    exactly the class of assumption this function exists to remove.
+    """
+    want = status_path_basename(requested)
+    got = status_path_basename(reported)
+    if not want or not got:
+        return False
+    return got == want or want in got or got in want
 
 
 def load_window_state() -> tuple[tuple[int, int, int, int] | None,
@@ -782,6 +986,16 @@ class MpvController:
         # poll loop could kill the mpv the worker had just launched, which
         # surfaced as a spurious "mpv 启动失败".
         self._lifecycle_lock = threading.RLock()
+        # Result of the last coarse-alignment seek: True when verified to have
+        # landed, False when the verification could not confirm it, None when no
+        # seek was requested. The follower reads this so its "已开始播放（起点
+        # Ns）" line does not assert a start point that was never confirmed
+        # (measured 2026-10-10: the log claimed 11.8s while the picture was at
+        # 0:00 -- a false success was indistinguishable from the real thing).
+        self.last_seek_verified: bool | None = None
+        # Last rectangle adopted because the user was dragging the window. Used
+        # only to avoid logging the same adoption on every 0.5s poll.
+        self._last_drag_adopt_rect: tuple[int, int, int, int] | None = None
 
     # ---------------- window geometry ----------------
 
@@ -1282,11 +1496,12 @@ class MpvController:
             return False
 
     def _seek_after_load(self, target_sec: float,
+                         expect_path: str = "",
                          load_timeout: float = 25.0,
                          seek_timeout: float = 8.0) -> bool:
-        """Seek to `target_sec` once the file has really loaded, then verify.
+        """Seek to `target_sec` once the NEW media has loaded, then verify.
 
-        Two races are handled here, both measured on this machine:
+        Three races are handled here, all measured on this machine:
 
         1. mpv needs time to OPEN the media (a bilibili DASH stream over the
            network took 2-5s). A `seek` sent before that is silently dropped,
@@ -1294,37 +1509,93 @@ class MpvController:
            was never observed to work.
         2. Even after loading, the seek has to travel through the 0.2s Lua
            command-file poll before mpv acts on it.
+        3. ★ The status file is NOT reset by `loadfile` (measured 2026-10-10,
+           user report "第一次切歌后直接从 0 开始播放"). It keeps holding the
+           PREVIOUS media's playhead until the Lua timer republishes, so both
+           "is it loaded?" and "did the seek land?" were being answered from
+           data about the OLD video.
 
-        So we wait for a readable position (proof the file is loaded), issue the
-        seek, then CONFIRM the position actually moved. Returns True only when
-        the seek verifiably took effect -- callers can log that honestly instead
-        of assuming success.
+        WHY (3) MATTERS -- THE FALSE POSITIVE THIS FIXES:
+            The old code proved "loaded" by `pos is not None`, which the stale
+            value satisfies instantly, and confirmed the seek with
+            `pos >= target_sec - 2.0`, which ANY earlier position at or beyond
+            the target also satisfies. On a song switch where the outgoing song
+            was further along than the new target -- e.g. old 90s, new target
+            11.8s -- the confirmation passed in 0.25s on the OLD video's
+            position, the caller logged "已开始播放（起点 11.8s）", and the
+            picture then began at 0:00 once the new file finally opened. Nothing
+            was ever sought. That is precisely the reported symptom, and it was
+            invisible in the log because it looked like success.
+
+        THE FIX: both phases now demand evidence about the media we asked for.
+            * Phase 1 waits until the status file describes the NEW media --
+              by path, by an observed playhead reset, or by a rewrite that is
+              newer than the loadfile we issued.
+            * Phase 2 only accepts a reading written AFTER the seek was issued
+              (an older rewrite cannot report the seek's effect) and requires
+              the playhead to actually BE at the target rather than merely
+              beyond it.
+        Returns True only when that evidence exists, so the caller can log
+        honestly instead of asserting success it cannot see (铁律 12).
         """
-        deadline = time.monotonic() + load_timeout
-        loaded = False
-        while time.monotonic() < deadline:
-            pos = self.get_position()
-            if pos is not None:
-                loaded = True
-                break
-            time.sleep(0.3)
-        if not loaded:
-            # No position yet: still try the seek (some sources report position
-            # late) but report failure honestly.
-            self.command(f"seek {target_sec:.2f} absolute+exact")
+        # Anything the Lua publishes from now on describes the post-loadfile
+        # world; anything older cannot have been affected by our request.
+        cmd_time = time.time()
+        pre_pos, _pre_mtime, pre_path = self.read_status_full()
+        want = status_path_basename(expect_path) if expect_path else ""
+
+        def _is_new_media(pos, mtime, path) -> bool:
+            """Whether this snapshot can only describe the media we loaded."""
+            if pos is None or mtime < cmd_time - 0.5:
+                return False        # stale rewrite: predates our loadfile
+            # Best evidence: mpv reports the media we asked for.
+            if want and paths_refer_to_same_media(expect_path, path):
+                return True
+            # The path changed to something else: the old media is gone.
+            if pre_path and path and path != pre_path:
+                return True
+            # Same URL replayed (e.g. the same song twice): the only observable
+            # signal is the RESET a fresh load produces -- the playhead drops
+            # back towards 0. Without this, a replay would look "already loaded"
+            # and the seek would race the open (race 1).
+            if pre_pos is not None and pos < pre_pos - 1.0:
+                return True
             return False
 
+        deadline = time.monotonic() + load_timeout
+        fresh_pos: float | None = None
+        while time.monotonic() < deadline:
+            pos, mtime, path = self.read_status_full()
+            if _is_new_media(pos, mtime, path):
+                fresh_pos = pos
+                break
+            time.sleep(0.3)
+
+        # Issue the seek in both cases: when we could not confirm the load the
+        # request may still work (some sources report position late), but the
+        # return value stays honest.
+        seek_cmd_time = time.time()
         self.command(f"seek {target_sec:.2f} absolute+exact")
-        # Confirm: the 0.2s poll plus mpv's own seek latency.
+
+        # A seek we never got to issue (channel down) cannot have taken effect.
+        if fresh_pos is None:
+            return False
+
+        # Confirm on evidence produced AFTER the seek: an older rewrite simply
+        # cannot know about it.
         seek_deadline = time.monotonic() + seek_timeout
         while time.monotonic() < seek_deadline:
             time.sleep(0.25)
-            pos = self.get_position()
-            if pos is None:
+            pos, mtime, path = self.read_status_full()
+            if pos is None or mtime <= seek_cmd_time:
                 continue
-            # Accept anything within a few seconds of the target: the video
-            # keeps playing while we poll, so pos is target + small delta.
-            if pos >= target_sec - 2.0:
+            # The playhead must BE at the target, not merely past it. The video
+            # keeps playing while we poll, so the landed value drifts forward a
+            # little; a tight band keeps a dropped seek from passing (a video
+            # playing from 0:00 cannot reach a 11.8s target within the 8s
+            # timeout, whereas the old `>= target-2` test let the OUTGOING
+            # song's position satisfy it immediately).
+            if abs(pos - target_sec) <= 2.5:
                 return True
         return False
 
@@ -1372,6 +1643,34 @@ class MpvController:
             return max(0.0, time.time() - STATUS_FILE.stat().st_mtime)
         except OSError:
             return 0.0
+
+    def read_status_full(self) -> tuple[float | None, float, str]:
+        """Read (position, mtime, path) from STATUS_FILE in ONE snapshot.
+
+        WHY ALL THREE AT ONCE (measured 2026-10-10): the Lua side rewrites this
+        file every 0.5s, so a position read in one instant and a path read in
+        another can belong to DIFFERENT rewrites -- and therefore to different
+        media. Reading them from a single `read_text()` (with the stat taken for
+        that same file) keeps the three fields describing one moment, which is
+        what lets a caller decide "is this position about the file I loaded?".
+
+        `mtime` is -1.0 when the file cannot be read, which is deliberately less
+        than any real timestamp so freshness tests fail closed.
+        """
+        try:
+            st = STATUS_FILE.stat()
+            text = STATUS_FILE.read_text(encoding="utf-8")
+        except OSError:
+            return (None, -1.0, "")
+        lines = text.splitlines()
+        pos: float | None = None
+        if lines and lines[0].strip():
+            try:
+                pos = float(lines[0].strip())
+            except ValueError:
+                pos = None
+        path = lines[2] if len(lines) > 2 else ""
+        return (pos, st.st_mtime, path)
 
     def seek(self, position_sec: float, exact: bool = True) -> bool:
         """Jump the running video to an absolute position.
@@ -1545,10 +1844,19 @@ class MpvController:
             # A silent failure here is indistinguishable from success in the
             # log, so the caller must be able to see it (铁律 12).
             if start_sec and start_sec > 0.5:
-                if not self._seek_after_load(start_sec):
+                # `safe` is the URL we just handed to loadfile; passing it lets
+                # the verification wait for THIS media instead of trusting a
+                # status file that may still describe the previous song
+                # (measured 2026-10-10, "第一次切歌后直接从 0 开始播放").
+                self.last_seek_verified = self._seek_after_load(
+                    start_sec, expect_path=safe)
+                if not self.last_seek_verified:
                     self._log_line(
                         f"  · ⚠ 粗对齐 seek 未确认生效（请求 {start_sec:.1f}s）；"
                         f"画面可能停在片头，闭环会纠正")
+            else:
+                # No coarse seek was requested, so there is nothing to verify.
+                self.last_seek_verified = None
 
         # Pin the window rectangle. mpv re-centres (and sometimes resizes) the
         # window a few seconds AFTER the video starts loading, so a one-shot
@@ -1617,6 +1925,34 @@ class MpvController:
                 # First sighting defines the pinned rectangle.
                 self._remember_geometry(rect)
             elif rect != pinned:
+                # A HUMAN IS DRAGGING RIGHT NOW: what they see is what they want,
+                # so adopt it continuously AND END the enforce period.
+                #
+                # WHY "ADOPT" AND NOT MERELY "STAND DOWN" (measured 2026-10-10,
+                # user's second report): the first version only skipped the yank
+                # WHILE the button was held, so the instant the user released it
+                # the still-active ENFORCE period yanked the window straight back
+                # -- the user still reported "无法移动". Adopting here also makes
+                # the dragged rectangle the PINNED one, which is what fixes the
+                # other half of the same report ("切歌后窗口从原本的大变成默认的
+                # 小"): the guard used to refuse to record a user-enlarged window
+                # (to keep mpv's self-enlargement out), so every song switch
+                # restored the old small remembered rect.
+                #
+                # The overlap test keeps a window dragged completely off the
+                # desktop from becoming the remembered position.
+                if (user_is_dragging()
+                        and rect_overlap_fraction(rect) >= DRAG_MIN_ON_SCREEN_FRACTION):
+                    with self._geometry_lock:
+                        self._enforce_until = 0.0
+                    if rect != self._last_drag_adopt_rect:
+                        self._last_drag_adopt_rect = rect
+                        self._log_line(
+                            f"  · 检测到用户拖动窗口 → 采纳 {rect}"
+                            f"（强制期结束，切歌不再拉回）")
+                    self._remember_geometry(rect, measurable=False)
+                    time.sleep(interval)
+                    continue
                 if enforce:
                     # Just after a launch/loadfile mpv re-centres itself, so a
                     # moved window here is mpv's doing and must be undone.
