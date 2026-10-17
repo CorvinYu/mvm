@@ -200,20 +200,48 @@ ALIGN_LOOP_RESYNC_AGREE_SEC = 3.0      # how close two samples must be to confir
 # stale-landing scenario while staying far below "wrong track" territory.
 ALIGN_LOOP_RESYNC_MAX_STEP_SEC = 30.0
 
-# Speed-based correction (session 9). See closed_loop_step for the full WHY.
+# Speed-based correction (session 9; redesigned for issue #4).
 #
-# GAIN: `speed = 1 + residual * GAIN`. With GAIN = 0.05 the picture gains back
-# a 1.0s lag at 5% speed-up, i.e. over ~20s -- about 3 probe periods -- which
-# is smooth enough to be imperceptible while fast enough to keep the lag from
-# growing. Higher gain corrects faster but makes the speed change noticeable.
-ALIGN_LOOP_SPEED_GAIN = 0.05
-# Clamp the speed change to +-5%. Beyond that the picture is visibly sped up
-# or slowed down, which looks worse than a small residual. A 5% bound still
-# corrects a 1s lag over ~20s.
-ALIGN_LOOP_SPEED_DELTA_MAX = 0.05
+# WHY THIS IS NO LONGER PROPORTIONAL WITH A FIXED GAIN (issue #4, user 2026-10-10):
+#   "歌曲和歌词对应的敏感性很高，不能要求缓慢地修正，应当快速地修正。你设置的
+#   0.05 阈值太低了"  and  "现状是每次设置完速度后，必然快于或慢于 1，导致一段
+#   时间之后必然再次出现偏移。应当让修改后在达到完全匹配那一刻立刻将速度改为 1."
+#
+# The old law was `speed = 1 - residual * 0.05`: a 1.0s error took ~20s to retire
+# and the speed sat away from 1.0x for that entire time. Both halves of that are
+# exactly what the user objects to. (a) 20s of visibly lagging lyrics is far too
+# long. (b) Worse, the time spent off 1.0x IS a new error being generated: the
+# picture keeps gaining at (speed-1) for as long as the ramp lasts, so the
+# correction always ends up over- or under-shooting and the loop must act again.
+#
+# The new law is FIXED TIME, NOT FIXED GAIN:
+#     speed = 1 - residual / ALIGN_LOOP_CATCHUP_SEC      (clamped)
+# i.e. "retire this error in CATCHUP_SEC seconds, whatever its size". The gain
+# therefore depends only on how much time we are willing to spend, and the
+# moment the picture is expected to be exactly aligned becomes a number known in
+# advance (now + CATCHUP_SEC). That is what lets the caller restore 1.0x AT that
+# instant instead of waiting for the next 6s probe to notice the residual happens
+# to be small -- the "必定快于或慢于 1" the user reported.
+#
+# The arithmetic is in REAL seconds: a picture running at `speed` gains
+# (speed - 1) seconds on the music per second of wall clock, so an error `r`
+# retired at `r / CATCHUP_SEC` per second takes exactly CATCHUP_SEC real seconds.
+ALIGN_LOOP_CATCHUP_SEC = 1.5
+# Clamp the speed change to +-25% (the user's choice). The cap only binds for
+# errors above CATCHUP_SEC * CAP = 0.375s; anything smaller is retired exactly,
+# one shot, in CATCHUP_SEC. A bigger error CANNOT be retired inside CATCHUP_SEC,
+# so closed_loop_step reports the LONGER deadline instead of pretending -- the
+# picture must never be declared aligned at a moment it is not.
+ALIGN_LOOP_SPEED_DELTA_MAX = 0.25
 # Below this speed change the correction is meaningless: a 0.1% speed tweak
-# cannot be perceived nor measured. Report instead of acting.
+# can neither be perceived nor measured. Report instead of acting.
 ALIGN_LOOP_MIN_SPEED_STEP = 0.005
+# How often the caller must re-check whether an in-flight speed ramp has reached
+# its deadline. This check is deliberately INDEPENDENT of ALIGN_LOOP_PERIOD_SEC:
+# waiting for the next 6s probe is precisely the bug the user reported. It only
+# reads the status file (no SMTC process launch), so it is cheap; the value is a
+# floor for callers, and POLL_INTERVAL_SEC (2.0s) is the current main loop rate.
+ALIGN_LOOP_RESTORE_TICK_SEC = 0.5
 # Minimum song age before the loop will act. Fine alignment can take 15-25s
 # (NOTES §1) and runs on the worker thread; correcting during it would fight the
 # alignment seek. This is a floor in addition to the explicit _pending/_lock
@@ -364,9 +392,17 @@ class Follower:
         # normal-sized.
         self._loop_anomaly_prev: float | None = None
         # The playback speed currently applied by the drift corrector (e.g.
-        # 1.02), or None when running at normal 1.0x. Reset to 1.0 when the
-        # residual returns to the deadband; cleared when the song changes.
+        # 1.02), or None when running at normal 1.0x. Cleared when the song
+        # changes.
         self._loop_speed_applied: float | None = None
+        # When the in-flight speed ramp is EXPECTED to have retired its error
+        # (monotonic). issue #4: the ramp must end AT that instant, not at the
+        # next probe -- so this deadline is checked on every poll by
+        # restore_speed_if_due(), a path independent of ALIGN_LOOP_PERIOD_SEC.
+        self._loop_speed_until: float | None = None
+        # How long the LAST speed ramp was computed to take (seconds). Exposed
+        # for the log ("N.Ns 内追平") and for tests; None when no ramp is live.
+        self.last_catchup_sec: float | None = None
         # Which TrackKey the loop is currently serving. Any change resets all of
         # the above, so a new song can never inherit the old song's cooldown or
         # strike count.
@@ -424,6 +460,8 @@ class Follower:
         self._loop_gave_up = False
         self._loop_anomaly_prev = None
         self._loop_speed_applied = None
+        self._loop_speed_until = None
+        self.last_catchup_sec = None
         self.last_loop_error = None
         self.last_loop_applied = None
         self._loop_applied_count = 0
@@ -447,21 +485,28 @@ class Follower:
 
     def closed_loop_step(self, key: TrackKey, music_position: float,
                          video_position: float, usable: bool,
-                         now: float | None = None) -> tuple[str, float | None]:
+                         now: float | None = None) -> tuple[str, float | None, float | None]:
         """One iteration of the drift loop -- PURE w.r.t. the player.
 
-        Returns (action, correction) where action is one of:
+        Returns (action, correction, deadline) where action is one of:
             "skip-deadband"  residual inside the deadband, nothing to do
             "skip-cooldown"  corrected recently, let the seek settle first
             "skip-warmup"    song too young (fine alignment may still be running)
             "skip-unreliable" the position feed is not trustworthy
             "skip-anomaly"   residual too large to be drift -> reported, not acted on
-            "speed"          target PLAYBACK SPEED (e.g. 1.02) for smooth drift
+            "speed"          target PLAYBACK SPEED (e.g. 1.20) for smooth drift
                              correction -- the caller sets mpv's speed property
+                             and MUST restore exactly 1.0x at `deadline`
+                             (monotonic seconds; None for actions that set no speed)
             "resync"         confirmed genuine desync -> caller must seek
             "correct"        legacy absolute seek correction (kept for callers
                              that have not migrated to speed)
             "gave-up"        too many unusable samples; loop disabled for this song
+
+        `deadline` is issue #4's fix: because the speed law is fixed-TIME, the
+        instant the picture is expected to be exactly aligned is known in
+        advance, so the caller can restore 1.0x then instead of waiting for the
+        residual to be noticed inside the deadband ("必然快于或慢于 1").
 
         WHY THIS IS A SEPARATE METHOD: the decision rules are the part worth
         testing, and they must be testable WITHOUT a real player or a real
@@ -478,21 +523,21 @@ class Follower:
             self._reset_loop_state(key)
 
         if self._loop_gave_up:
-            return ("gave-up", None)
+            return ("gave-up", None, None)
 
         if not usable:
             # HARD REQUIREMENT (task-1 C): a player whose SMTC position freezes
             # must be SKIPPED, never "corrected" against a stale number. 汽水音乐
             # was measured holding one value for 15s (NOTES §1), which would
             # otherwise look like a huge, stable offset and produce a seek storm.
-            return ("skip-unreliable", None)
+            return ("skip-unreliable", None, None)
 
         detected = self._detected_at
         if detected is not None and (now - detected) < ALIGN_LOOP_WARMUP_SEC:
-            return ("skip-warmup", None)
+            return ("skip-warmup", None, None)
         if self._loop_last_apply is not None and \
                 (now - self._loop_last_apply) < ALIGN_LOOP_COOLDOWN_SEC:
-            return ("skip-cooldown", None)
+            return ("skip-cooldown", None, None)
 
         residual = self.measure_residual(video_position, music_position,
                                          self._manual_offset_sec)
@@ -503,7 +548,7 @@ class Follower:
             # baseline 0.2-0.6s). Do NOTHING -- a seek here is a visible jump
             # that would make the picture worse than the residual it removed.
             self._loop_strikes = 0
-            return ("skip-deadband", None)
+            return ("skip-deadband", None, None)
 
         if abs(residual) > ALIGN_LOOP_MAX_STEP_SEC:
             # Too large to be ordinary drift. Two very different situations land
@@ -535,13 +580,13 @@ class Follower:
                     self._loop_strikes += 1
                     if self._loop_strikes >= ALIGN_LOOP_MAX_STRIKES:
                         self._loop_gave_up = True
-                        return ("gave-up", None)
-                    return ("skip-anomaly", residual)
+                        return ("gave-up", None, None)
+                    return ("skip-anomaly", residual, None)
                 self._loop_last_apply = now
                 self.last_loop_applied = -residual
                 self._loop_applied_count += 1
                 self._loop_strikes = 0
-                return ("resync", -residual)
+                return ("resync", -residual, None)
 
             # First large sample (or it disagreed with the previous one): wait
             # for confirmation instead of acting on what may be one bad read.
@@ -551,14 +596,14 @@ class Follower:
                 # Repeatedly inconsistent large residuals: no stable reading to
                 # act on, so stop trying for this song rather than seek blindly.
                 self._loop_gave_up = True
-                return ("gave-up", None)
-            return ("skip-anomaly", residual)
+                return ("gave-up", None, None)
+            return ("skip-anomaly", residual, None)
 
         # A normal-sized residual clears the anomaly memory: the next large
         # reading must again be confirmed before it triggers a resync.
         self._loop_anomaly_prev = None
 
-        # ---------------- speed-based correction (session 9) ----------------
+        # ---------------- speed-based correction (issue #4: fixed time) ------
         #
         # WHY SPEED, NOT SEEK, FOR ORDINARY DRIFT (user report 2026-10-08:
         # "本来比较对齐，调整后不对齐了"): every closed-loop correction used to
@@ -571,62 +616,61 @@ class Follower:
         # with 9 of 27 adjacent corrections in OPPOSITE directions: the loop was
         # sawtoothing, which is exactly what the user saw as "调整后不对齐".
         #
-        # For sub-second drift the right response is to nudge the PLAYBACK SPEED
-        # instead: mpv's `speed` property runs the picture at 1.0 * ratio, so a
-        # speed of 1.01 makes the video advance 1% faster than the music and the
-        # lag shrinks smoothly, with no visible jump. The speed is returned to
-        # 1.0 once the residual is back inside the deadband.
-        #
-        # The gain is deliberately SMALL: the loop samples every 6s, and a
-        # residual of r needs the picture to gain r seconds at a rate of
-        # (speed - 1) seconds per second, i.e. roughly `speed = 1 + r / (3s)`
-        # if we want to recover over ~3 probe periods. Clamped to a range that
-        # keeps the motion imperceptible (ALIGN_LOOP_SPEED_MAX).
+        # WHY SPEED AND NOT A SEEK IS STILL RIGHT, but the LAW changed (issue #4,
+        # user 2026-10-10). The old proportional-with-gain law needed ~20s per
+        # second of error and left the speed off 1.0x the whole time -- "不能要求
+        # 缓慢地修正" + "每次设置完速度后，必然快于或慢于 1". The law is now
+        #     speed = 1 - residual / ALIGN_LOOP_CATCHUP_SEC   (clamped)
+        # i.e. retire the ENTIRE error in CATCHUP_SEC (1.5s) whatever its size,
+        # and report now + CATCHUP_SEC as the deadline at which the caller must
+        # put the speed back to exactly 1.0. See the constants block for the WHY.
         #
         # SIGN (easy to get wrong -- an earlier draft did): `residual > 0`
         # means the picture is AHEAD of the music (measure_residual), so the
-        # picture must SLOW DOWN, i.e. speed < 1.0. Hence `speed = 1 - r*GAIN`.
-        #
-        # PURE P-CONTROL NEVER FULLY CONVERGES (measured in the convergence
-        # test): as the residual shrinks, the proportional speed difference
-        # shrinks with it, so the catch-up rate goes to zero and the picture
-        # hovers just OUTSIDE the deadband forever. The fix is a MINIMUM
-        # correction floor: once we have decided to correct, the speed must
-        # differ by at least ALIGN_LOOP_MIN_SPEED_STEP so the residual keeps
-        # shrinking instead of asymptotically stalling. This is standard
-        # proportional-with-floor control, and it is what lets the test (and a
-        # real song) actually get back INSIDE the deadband.
-        proportional = max(-ALIGN_LOOP_SPEED_DELTA_MAX,
-                           min(ALIGN_LOOP_SPEED_DELTA_MAX,
-                               -residual * ALIGN_LOOP_SPEED_GAIN))
+        # picture must SLOW DOWN, i.e. speed < 1.0. Hence the leading minus.
+        raw_delta = -residual / ALIGN_LOOP_CATCHUP_SEC
+        clamped = max(-ALIGN_LOOP_SPEED_DELTA_MAX,
+                      min(ALIGN_LOOP_SPEED_DELTA_MAX, raw_delta))
         # A floor that preserves the SIGN of the correction: picture ahead ->
         # at least MIN_SPEED_STEP slower; picture behind -> at least MIN_SPEED_STEP
-        # faster. Only applies when the proportional term is too small to matter.
-        if abs(proportional) < ALIGN_LOOP_MIN_SPEED_STEP:
-            proportional = (ALIGN_LOOP_MIN_SPEED_STEP
-                            if proportional >= 0 else
-                            -ALIGN_LOOP_MIN_SPEED_STEP)
-        speed = 1.0 + proportional
+        # faster. Only applies when the fixed-time term is too small to matter.
+        if abs(clamped) < ALIGN_LOOP_MIN_SPEED_STEP:
+            clamped = (ALIGN_LOOP_MIN_SPEED_STEP
+                       if clamped >= 0 else
+                       -ALIGN_LOOP_MIN_SPEED_STEP)
+        speed = 1.0 + clamped
         if abs(speed - 1.0) < ALIGN_LOOP_MIN_SPEED_STEP:
             # The drift is real but too small to compensate without an
             # imperceptible-yet-meaningless speed tweak. Report and do nothing;
             # the next probe re-evaluates.
             self._loop_strikes = 0
-            return ("skip-deadband", None)
+            return ("skip-deadband", None, None)
+
+        # The deadline is computed from what the CLAMPED speed can actually
+        # achieve. When the cap binds (|residual| > CATCHUP_SEC * CAP = 0.375s)
+        # the error cannot be retired in CATCHUP_SEC, so the ramp legitimately
+        # takes |residual| / CAP seconds. Reporting CATCHUP_SEC anyway would
+        # restore 1.0x with an error still on the clock -- the very "必然再次
+        # 出现偏移" the user reported, only smaller.
+        realised_sec = abs(residual) / abs(clamped)
+        deadline = now + realised_sec
+        # Expose the achieved ramp to the caller (and to the log) so the user can
+        # see the promise being kept: speed, error, and the moment of 1.0x.
+        self.last_catchup_sec = realised_sec
 
         # Enforce a cooldown between SPEED changes too: changing speed every 6s
-        # is fine, but rapid oscillation between 1.01 and 0.99 would be visible
-        # as pulsing. One cooldown period is enough because the speed change
-        # itself is smooth.
+        # is fine, but rapid oscillation between two speeds would be visible as
+        # pulsing. One cooldown period is enough because a ramp now ENDS by
+        # itself at `deadline` instead of waiting to be noticed.
         if self._loop_last_apply is not None and \
                 (now - self._loop_last_apply) < ALIGN_LOOP_COOLDOWN_SEC:
-            return ("skip-cooldown", None)
+            return ("skip-cooldown", None, None)
 
         self._loop_last_apply = now
         self.last_loop_applied = speed
         self._loop_applied_count += 1
         self._loop_strikes = 0
-        return ("speed", speed)
+        return ("speed", speed, deadline)
 
     def _age_video_position(self, raw_position: float | None,
                             read_at: float, now: float,
@@ -662,6 +706,58 @@ class Follower:
         if age > ALIGN_LOOP_VIDEO_STALE_SEC:
             return None
         return raw_position + age
+
+    def _restore_speed(self, why: str) -> None:
+        """Put the playback speed back to exactly 1.0x and report it."""
+        self.player.set_property("speed", "1.0")
+        self._loop_speed_applied = None
+        self._loop_speed_until = None
+        self.log(f"    · 已恢复 1.0x 速度（{why}）")
+
+    def restore_speed_if_due(self, key: TrackKey | None = None) -> bool:
+        """End an in-flight speed ramp AT its deadline. Call on every poll.
+
+        WHY THIS EXISTS (issue #4, user 2026-10-10): "现状是每次设置完速度后，
+        必然快于或慢于 1，导致一段时间之后必然再次出现偏移。应当让修改后在达到
+        完全匹配那一刻立刻将速度改为 1."
+
+        Previously the only place the speed went back to 1.0 was the 6s drift
+        probe, and only when that probe happened to read the residual inside the
+        deadband. So a 1.5s ramp could stay applied for up to a full probe period
+        -- during which the picture kept drifting at (speed - 1) past the point
+        where it was already aligned. That overshoot is what produced the NEXT
+        correction, forever.
+
+        Because the speed law is fixed-TIME (see ALIGN_LOOP_CATCHUP_SEC), the
+        moment of alignment is known when the ramp starts, so this check needs
+        no measurement at all -- it only reads the clock, which makes it cheap
+        enough to call on every poll (POLL_INTERVAL_SEC) instead of once per
+        probe period.
+
+        Returns True when a speed was actually restored this call.
+        """
+        if self._loop_speed_applied is None:
+            return False
+        # A different song is now on screen: the ramp belonged to the old one.
+        # Drop the state WITHOUT writing to the player -- the new song's window
+        # is started fresh at 1.0x by _reset_loop_state / play_url.
+        if key is not None and self._loop_key is not None and key != self._loop_key:
+            self._loop_speed_applied = None
+            self._loop_speed_until = None
+            return False
+        deadline = self._loop_speed_until
+        if deadline is not None and time.monotonic() < deadline:
+            return False
+        overdue = 0.0 if deadline is None else time.monotonic() - deadline
+        self._restore_speed(
+            "已到理论追平时刻" if deadline is not None else "追平截止时刻丢失")
+        if deadline is not None and overdue > ALIGN_LOOP_RESTORE_TICK_SEC:
+            # The caller polled too slowly to end the ramp on time. Worth saying
+            # out loud: it means the promise "到点立即回到 1.0x" is being missed
+            # by the poll rate, not by the ramp itself.
+            self.log(f"    · ⚠ 归位晚了 {overdue:.1f}s（轮询跟不上 "
+                     f"{ALIGN_LOOP_RESTORE_TICK_SEC}s 的检查粒度）")
+        return True
 
     def _maybe_correct_drift(self, session: NowPlaying, key: TrackKey) -> None:
         """The periodic closed-loop probe. Safe to call on every poll.
@@ -753,7 +849,7 @@ class Follower:
         self._loop_unusable_streak = 0
 
         assert video_pos is not None
-        action, correction = self.closed_loop_step(
+        action, correction, speed_deadline = self.closed_loop_step(
             key, music_position=music_pos, video_position=video_pos,
             usable=True, now=now,
         )
@@ -769,14 +865,14 @@ class Follower:
             residual = self.last_loop_error or 0.0
             self.log(f"  · 闭环校验：音乐 {music_pos:.1f}s vs 画面 {video_pos:.1f}s "
                      f"→ 偏差 {residual:+.1f}s，在死区（±{ALIGN_LOOP_DEADBAND_SEC:.2f}s）内，不调整")
-            # Restore normal speed once the picture is back inside the deadband.
-            # Without this, a speed that was set to chase a previous drift stays
-            # in place and the picture OVERSHOOTS into the other direction --
-            # the sawtooth pattern the user reported ("调整后不对齐").
+            # Safety net only. Since issue #4 the in-flight ramp is ended by
+            # `restore_speed_if_due()` at its own deadline, which is derived
+            # from the fixed catch-up time -- waiting for this probe to notice
+            # the deadband is exactly the "必然快于或慢于 1" the user reported.
+            # Keep the net for the case where a ramp was armed and the deadline
+            # was lost (e.g. the song was re-adopted without a reset).
             if self._loop_speed_applied is not None:
-                self.player.set_property("speed", "1.0")
-                self._loop_speed_applied = None
-                self.log("    · 已恢复 1.0x 速度（偏差回到死区）")
+                self._restore_speed("偏差回到死区")
             return
         if action == "skip-anomaly":
             # `correction` is the RESIDUAL here (see closed_loop_step), not a
@@ -810,16 +906,26 @@ class Follower:
                          f"—— 下个周期会重新测量")
             return
         if action == "speed":
-            # Smooth drift correction: nudge the playback speed instead of
-            # seeking. `correction` here is the target SPEED (e.g. 1.02).
+            # Fixed-time drift correction: ramp the playback speed instead of
+            # seeking. `correction` here is the target SPEED (e.g. 1.20) and
+            # `speed_deadline` is the moment that ramp is expected to land the
+            # picture exactly on the music.
             with self._lock:
                 if self._pending != key or self.current != key:
                     return
             speed = float(correction)
-            self.player.set_property("speed", f"{speed:.4f}")
+            if not self.player.set_property("speed", f"{speed:.4f}"):
+                # The command file was not written (mpv gone / channel down).
+                # Do NOT arm a deadline for a speed that never took effect --
+                # that would "restore" 1.0x later and log a lie.
+                self.log(f"  · 闭环校验：偏差 {self.last_loop_error:+.1f}s"
+                         f" → 调速命令发送失败，本周期不调")
+                return
             self._loop_speed_applied = speed
+            self._loop_speed_until = speed_deadline
+            catchup = self.last_catchup_sec or 0.0
             self.log(f"  · 闭环校验：偏差 {self.last_loop_error:+.1f}s"
-                     f" → 播放速度 {speed:.2f}x（平滑追平，无跳变）")
+                     f" → 播放速度 {speed:.2f}x（{catchup:.1f}s 内追平，到点立即回 1.0x）")
             return
         if action != "correct" or correction is None:
             return
@@ -1149,6 +1255,13 @@ class Follower:
             # This is the periodic re-check that closes that loop. It is
             # self-throttling (ALIGN_LOOP_PERIOD_SEC), never blocks, and is a
             # no-op when alignment is off.
+            # issue #4: end any in-flight speed ramp at ITS deadline, before the
+            # (self-throttling) drift probe below. This runs on EVERY poll, so
+            # the picture returns to exactly 1.0x at the computed alignment
+            # instant instead of waiting up to a full ALIGN_LOOP_PERIOD_SEC for
+            # the probe to notice. Doing it first also means the probe below
+            # measures the residual of a 1.0x playback, not a half-finished ramp.
+            self.restore_speed_if_due(key)
             if self.align and self.current is not None:
                 self._maybe_correct_drift(session, key)
             return  # same song, nothing else to do

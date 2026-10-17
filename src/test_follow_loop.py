@@ -91,6 +91,22 @@ def period_of(follow_mod, default: float) -> float:
     return float(getattr(follow_mod, "ALIGN_LOOP_PERIOD_SEC", default))
 
 
+def speed_cap_of(follow_mod, default: float) -> float:
+    """The corrector's speed clamp, read from the module under test.
+
+    Read rather than hard-coded: issue #4 raised it from 0.05 to 0.25, and a
+    test that pins the number would just have to be edited in lockstep (which
+    proves nothing about the behaviour). The criterion is that the clamp is
+    HONOURED, not that it has a particular value.
+    """
+    return float(getattr(follow_mod, "ALIGN_LOOP_SPEED_DELTA_MAX", default))
+
+
+def catchup_of(follow_mod, default: float) -> float:
+    """The fixed catch-up time (issue #4)."""
+    return float(getattr(follow_mod, "ALIGN_LOOP_CATCHUP_SEC", default))
+
+
 def step_of(follow_mod):
     """The corrector callable, or a stub that models the OLD behaviour.
 
@@ -283,22 +299,44 @@ def check_convergence(follow_mod) -> bool:
     print(f"  {'t(s)':>6} {'画面':>9} {'音乐':>9} {'偏差':>8}  动作")
     t = 60.0
     trace = []
+    # issue #4: the CALLER is responsible for ending a ramp at its deadline, and
+    # the main loop does that on every poll (restore_speed_if_due), i.e. ~2s
+    # granularity, NOT once per 6s probe. Modelling it at probe granularity
+    # would apply a 1.5s ramp for a full 6s -- a 4x over-correction that the
+    # real code never performs, and which would make this criterion reject a
+    # corrector that is in fact fine.
+    deadline = None
+    poll = 2.0                       # POLL_INTERVAL_SEC in the real daemon
+
+    def advance(span: float) -> None:
+        video.position += span * video.speed + drift_per_period * span / period
+        music.position += music.rate * span
+
     for _ in range(50):
-        # Between probes the video advances at its CURRENT speed -- that is the
-        # whole point of speed correction: setting speed 1.04 makes the picture
-        # GAIN on the music without any jump.
-        video.position += period * video.speed + drift_per_period
-        music.position += music.rate * period
-        t += period
-        action, correction = step(
+        # Advance in real time, ending the ramp at its deadline en route.
+        left = period
+        while left > 1e-9:
+            if deadline is not None:
+                until = min(left, max(0.0, deadline - t))
+                if until > 0:
+                    advance(until)
+                    t += until
+                    left -= until
+                if deadline is not None and t >= deadline:
+                    video.set_speed(1.0)      # <- the real caller's restore
+                    deadline = None
+                continue
+            hop = min(left, poll)
+            advance(hop)
+            t += hop
+            left -= hop
+        action, correction, new_deadline = step(
             key, music_position=music.position, video_position=video.position,
             usable=True, now=t,
         )
         if action == "speed" and correction is not None:
             video.set_speed(correction)
-        elif action == "skip-deadband":
-            # Back inside the deadband: the real loop restores 1.0x; model that.
-            video.set_speed(1.0)
+            deadline = new_deadline
         residual = video.position - music.position
         trace.append(residual)
         if _ < 8 or _ > 42:
@@ -326,8 +364,9 @@ def check_convergence(follow_mod) -> bool:
     ok &= check("速度调整方向正确（画面超前 -> 减速）",
                 any(s < 1.0 for s in video.speeds),
                 f"speed 序列: {[round(s, 3) for s in video.speeds[:6]]}…")
-    ok &= check("速度从未超过 ±5% 上限",
-                all(0.95 <= s <= 1.05 for s in video.speeds),
+    cap = speed_cap_of(follow_mod, 0.25)
+    ok &= check(f"速度从未超过 ±{cap*100:.0f}% 上限",
+                all(1.0 - cap - 1e-9 <= s <= 1.0 + cap + 1e-9 for s in video.speeds),
                 f"min={min(video.speeds):.3f}, max={max(video.speeds):.3f}")
     ok &= check(f"持续漂移下残差有界（收敛后峰值 < {2*deadband:.2f}s）",
                 peak_after < 2 * deadband, f"峰值 {peak_after:.3f}s")
@@ -362,7 +401,7 @@ def check_unreliable_skipped(follow_mod) -> bool:
         action, correction = step(
             key, music_position=105.0, video_position=145.0,
             usable=False, now=t,
-        )
+        )[:2]
         actions.append((action, correction))
 
     ok = check("不可靠输入 -> 从未产生任何微调量",
@@ -387,7 +426,7 @@ def check_unreliable_skipped(follow_mod) -> bool:
     for _ in range(4):
         t += period
         got.append(step2(key, music_position=100.0, video_position=140.0,
-                         usable=True, now=t))
+                         usable=True, now=t)[:2])
     ok &= check("40s 的『偏差』被拒绝，而不是被 seek 掉",
                 all(a != "correct" for a, _ in got), f"{[a for a, _ in got]}")
     if hasattr(F, "closed_loop_step"):
@@ -499,7 +538,7 @@ def check_confirmed_desync_recovers(follow_mod) -> bool:
         music = 100.0 + i * period
         video = music - 29.0 + (0.2 if i % 2 else -0.2)
         results.append(step(key, music_position=music, video_position=video,
-                            usable=True, now=t))
+                            usable=True, now=t)[:2])
 
     actions = [a for a, _ in results]
     ok = check("首次大偏差先只确认、不动作",
@@ -527,7 +566,7 @@ def check_confirmed_desync_recovers(follow_mod) -> bool:
         # Residuals 20s, -5s, 15s: nothing agrees with anything.
         video = music + [20.0, -5.0, 15.0][i]
         wild.append(step2(key, music_position=music, video_position=video,
-                          usable=True, now=t))
+                          usable=True, now=t)[:2])
     ok &= check("互不一致的大偏差 -> 从不 resync（拒绝坏样本）",
                 all(a != "resync" for a, _ in wild), f"{[a for a, _ in wild]}")
 
@@ -541,7 +580,7 @@ def check_confirmed_desync_recovers(follow_mod) -> bool:
         music = 100.0 + i * period
         video = music - 120.0        # 120s: wrong track, not drift
         huge.append(step3(key, music_position=music, video_position=video,
-                          usable=True, now=t))
+                          usable=True, now=t)[:2])
     ok &= check("超过上限的巨大偏差 -> 不 resync（疑似选错视频）",
                 all(a != "resync" for a, _ in huge), f"{[a for a, _ in huge]}")
     return ok
@@ -630,9 +669,10 @@ def check_integration(follow_mod) -> bool:
     ok &= check("偏差 +0.80s -> 真的调整了播放速度（画面被平滑追平）",
                 len(player.speeds) == 1 and player.speeds[0] < 1.0,
                 f"speeds={[round(s, 3) for s in player.speeds]}")
-    ok &= check("速度变化在 ±5% 内且不跳变",
+    ok &= check("速度变化在钳制上限内且不跳变",
                 len(player.speeds) == 1
-                and 0.95 <= player.speeds[0] < 1.0,
+                and 1.0 - speed_cap_of(follow_mod, 0.25) - 1e-9
+                <= player.speeds[0] < 1.0,
                 f"speed={player.speeds[0] if player.speeds else None}")
     ok &= check("日志含「闭环校验」与偏差数值（用户可验收）",
                 any("闭环校验" in m and "偏差" in m for m in f.logs),
@@ -742,6 +782,143 @@ def check_manual_offset_respected(follow_mod) -> bool:
     return ok
 
 
+def check_issue4_fast_and_exact(follow_mod) -> bool:
+    """issue #4: 快速追平 + 到点立刻回 1.0x（用户 2026-10-10 的两点要求）。
+
+    用户原话：
+      1. "歌曲和歌词对应的敏感性很高，不能要求缓慢地修正，应当快速地修正。
+          你设置的 0.05 阈值太低了。"
+      2. "现状是每次设置完速度后，必然快于或慢于 1，导致一段时间之后必然再次
+          出现偏移。应当让修改后在达到完全匹配那一刻立刻将速度改为 1."
+
+    Two independent criteria:
+
+      A. FIXED TIME -- the ramp's promised length must be ~ALIGN_LOOP_CATCHUP_SEC
+         for any error the cap can retire, i.e. the corrector no longer spends
+         ~1/0.05 = 20s per second of error. Checked on the deadline the real
+         decision function returns.
+
+      B. DEADLINE RESTORE -- the speed must be exactly 1.0x at the deadline, not
+         at the next 6s probe. Driven through the REAL `restore_speed_if_due`
+         with a controlled clock. The old code has no such entry point at all
+         (it only restored when a probe happened to read the deadband), so this
+         criterion cannot pass on it.
+    """
+    banner("CHECK 8  (#4) 快速追平 + 到点立刻回 1.0x")
+    F, step = step_of(follow_mod)
+    if F is None:
+        return check("模块提供 Follower", False, "旧代码无此类型")
+
+    key = follow_mod.TrackKey(title="t", artist="a", duration_bucket=1)
+    catchup = catchup_of(follow_mod, 1.5)
+    cap = speed_cap_of(follow_mod, 0.25)
+    ok = True
+
+    # ---- A. the ramp length is the fixed time, not a fixed gain ----------
+    print(f"  期望追平时长 = {catchup}s，速度钳制 ±{cap*100:.0f}%")
+    print(f"  {'偏差':>8} {'速度':>8} {'承诺追平':>10} {'理论值':>8}")
+    worst_small = 0.0
+    for residual in (0.30, 0.35):
+        f, st = step_of(follow_mod)
+        got = st(key, music_position=100.0, video_position=100.0 + residual,
+                 usable=True, now=60.0)
+        # The old code returns a 2-tuple (no deadline), so unpack by LENGTH
+        # rather than crashing: a criterion must fail on BEHAVIOUR, and
+        # "the module raised ValueError" proves nothing about the drift loop.
+        action, speed = got[0], got[1]
+        deadline = got[2] if len(got) > 2 else None
+        if action != "speed" or speed is None or deadline is None:
+            ok &= check(f"{residual:+.2f}s 偏差 -> 产生调速且给出截止时刻",
+                        False, f"got={got}")
+            continue
+        promised = deadline - 60.0
+        ideal = abs(residual) / abs(speed - 1.0)
+        worst_small = max(worst_small, abs(promised - ideal))
+        print(f"  {residual:+8.2f} {speed:8.3f} {promised:10.2f} {ideal:8.2f}")
+        # 0.30s is below catch-up*cap = 0.375s, so the cap does NOT bind and the
+        # promise must be exactly `catchup`.
+        if residual <= catchup * cap + 1e-9:
+            ok &= check(f"偏差 {residual:.2f}s（未触及速度上限）承诺在 {catchup}s 内追平",
+                        abs(promised - catchup) < 1e-6,
+                        f"承诺 {promised:.2f}s")
+    ok &= check("承诺的追平时长 = 偏差 / 实际速度差（自洽，不会报错时刻）",
+                worst_small < 1e-6, f"最大偏差 {worst_small:.2e}s")
+    # Behavioural negative control, not a constant lookup: on the OLD law a 1.0s
+    # error is retired at the old fixed speed cap, i.e. ~1/0.05 = 20s. Measure
+    # what the module under test actually does with a 1.0s error.
+    f_old, st_old = step_of(follow_mod)
+    got_1s = st_old(key, music_position=200.0, video_position=201.0,
+                    usable=True, now=60.0)
+    if got_1s[0] == "speed" and got_1s[1]:
+        sp = float(got_1s[1])
+        per_sec = abs(sp - 1.0)
+        retire_1s = 1.0 / per_sec if per_sec > 0 else float("inf")
+        print(f"  1.0s 偏差 -> 速度 {sp:.3f}，按此速率需 {retire_1s:.1f}s 追平")
+        ok &= check("1.0s 的偏差在数秒内追平（旧固定增益需 ~20s，用户嫌太慢）",
+                    retire_1s <= 4.5, f"需 {retire_1s:.1f}s")
+    else:
+        ok &= check("1.0s 的偏差会产生调速", False, f"got={got_1s}")
+
+    # ---- B. the speed goes back to 1.0x AT the deadline ------------------
+    if not hasattr(F, "restore_speed_if_due"):
+        ok &= check("Follower 提供到点归位入口 restore_speed_if_due", False,
+                    "旧代码只能靠下一次 6s 采样偶然发现已回死区 → 用户报的"
+                    "「必然快于或慢于 1」")
+        return ok
+
+    import time as _t
+    f, player = make_wired_follower(follow_mod, video_pos=100.8, music_pos=100.0)
+    f.current = key
+    f._pending = key
+    f._detected_at = 0.0
+    f._loop_last_probe = None
+    f._maybe_correct_drift(FakeSession(), key)
+    applied = player.speeds[-1] if player.speeds else 1.0
+    ok &= check("先真的进入了调速状态", applied != 1.0, f"speed={applied}")
+    deadline = f._loop_speed_until
+    ok &= check("记录了追平截止时刻", deadline is not None, f"deadline={deadline}")
+
+    # Just BEFORE the deadline nothing must happen (the ramp is still needed).
+    if deadline is not None:
+        saved = _t.monotonic
+        try:
+            _t.monotonic = lambda: deadline - 0.6          # 0.6s early
+            restored = f.restore_speed_if_due(key)
+        finally:
+            _t.monotonic = saved
+        ok &= check("截止前不提前归位（否则等于没追完）", restored is False
+                    and f._loop_speed_applied == applied,
+                    f"restored={restored}, speed={f._loop_speed_applied}")
+
+        # At/after the deadline the speed must be exactly 1.0 -- without any
+        # further drift probe being involved.
+        saved = _t.monotonic
+        try:
+            _t.monotonic = lambda: deadline + 0.01
+            restored = f.restore_speed_if_due(key)
+        finally:
+            _t.monotonic = saved
+        ok &= check("到点（+10ms）立即恢复 1.0x，不等下一次 6s 采样",
+                    restored is True and player.speeds[-1] == 1.0,
+                    f"speeds={[round(s, 3) for s in player.speeds]}")
+        ok &= check("归位后清空在飞状态（不会重复归位）",
+                    f._loop_speed_applied is None and f._loop_speed_until is None
+                    and f.restore_speed_if_due(key) is False)
+        ok &= check("归位写进了日志（用户可验收）",
+                    any("已恢复 1.0x" in m for m in f.logs),
+                    f"{[m.strip() for m in f.logs[-2:]]}")
+
+    # ---- C. the promise is checked on EVERY poll, not per 6s probe ------
+    # The main loop must call the restore entry point outside the (throttled)
+    # drift probe; otherwise "到点立即归位" still waits up to a probe period.
+    import inspect
+    src = inspect.getsource(F.step) if hasattr(F, "step") else ""
+    ok &= check("主循环 step() 每轮都检查归位（独立于 6s 探针）",
+                "restore_speed_if_due" in src,
+                "未在主循环里调用" if not src else "")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--old", action="store_true",
@@ -782,6 +959,7 @@ def main() -> int:
     results.append(check_manual_offset_respected(follow_mod))
     results.append(check_confirmed_desync_recovers(follow_mod))
     results.append(check_staleness_compensated(follow_mod))
+    results.append(check_issue4_fast_and_exact(follow_mod))
 
     banner("汇总")
     passed = sum(1 for r in results if r)

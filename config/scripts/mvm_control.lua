@@ -357,6 +357,14 @@ mp.register_event("file-loaded", function()
     manual_track = mp.get_property("path") or ""
     manual_offset = 0.0
     publish_manual_sidecar()
+    -- issue #4: the drift loop ramps `speed` away from 1.0x to catch up and
+    -- restores it when the error is retired. If a new file is loaded while a
+    -- ramp is still in flight (song changed mid-correction), mpv would keep the
+    -- old speed and the NEW song would start life playing at, say, 0.75x. The
+    -- follower also resets this, but doing it here too makes the invariant
+    -- "a freshly loaded file always plays at 1.0x" hold even if the daemon
+    -- never gets a chance to (crash, kill, or a hand-driven loadfile).
+    mp.set_property_native("speed", 1.0)
     write_status()
 end)
 
