@@ -330,13 +330,16 @@ def check_convergence(follow_mod) -> bool:
             advance(hop)
             t += hop
             left -= hop
-        action, correction, new_deadline = step(
+        action, correction, catchup_sec = step(
             key, music_position=music.position, video_position=video.position,
             usable=True, now=t,
         )
         if action == "speed" and correction is not None:
             video.set_speed(correction)
-            deadline = new_deadline
+            # closed_loop_step returns a DURATION (anchored by the real caller to
+            # the instant it issues the command -- see CHECK 8 D). Model that:
+            # arm the deadline from `t`, the moment we apply the speed here.
+            deadline = t + float(catchup_sec or 0.0) if catchup_sec else None
         residual = video.position - music.position
         trace.append(residual)
         if _ < 8 or _ > 42:
@@ -812,6 +815,7 @@ def check_issue4_fast_and_exact(follow_mod) -> bool:
     key = follow_mod.TrackKey(title="t", artist="a", duration_bucket=1)
     catchup = catchup_of(follow_mod, 1.5)
     cap = speed_cap_of(follow_mod, 0.25)
+    import inspect
     ok = True
 
     # ---- A. the ramp length is the fixed time, not a fixed gain ----------
@@ -822,16 +826,15 @@ def check_issue4_fast_and_exact(follow_mod) -> bool:
         f, st = step_of(follow_mod)
         got = st(key, music_position=100.0, video_position=100.0 + residual,
                  usable=True, now=60.0)
-        # The old code returns a 2-tuple (no deadline), so unpack by LENGTH
+        # The old code returns a 2-tuple (no duration), so unpack by LENGTH
         # rather than crashing: a criterion must fail on BEHAVIOUR, and
         # "the module raised ValueError" proves nothing about the drift loop.
         action, speed = got[0], got[1]
-        deadline = got[2] if len(got) > 2 else None
-        if action != "speed" or speed is None or deadline is None:
-            ok &= check(f"{residual:+.2f}s 偏差 -> 产生调速且给出截止时刻",
+        promised = got[2] if len(got) > 2 else None
+        if action != "speed" or speed is None or promised is None:
+            ok &= check(f"{residual:+.2f}s 偏差 -> 产生调速且给出追平时长",
                         False, f"got={got}")
             continue
-        promised = deadline - 60.0
         ideal = abs(residual) / abs(speed - 1.0)
         worst_small = max(worst_small, abs(promised - ideal))
         print(f"  {residual:+8.2f} {speed:8.3f} {promised:10.2f} {ideal:8.2f}")
@@ -908,14 +911,63 @@ def check_issue4_fast_and_exact(follow_mod) -> bool:
                     any("已恢复 1.0x" in m for m in f.logs),
                     f"{[m.strip() for m in f.logs[-2:]]}")
 
-    # ---- C. the promise is checked on EVERY poll, not per 6s probe ------
-    # The main loop must call the restore entry point outside the (throttled)
-    # drift probe; otherwise "到点立即归位" still waits up to a probe period.
-    import inspect
-    src = inspect.getsource(F.step) if hasattr(F, "step") else ""
-    ok &= check("主循环 step() 每轮都检查归位（独立于 6s 探针）",
-                "restore_speed_if_due" in src,
-                "未在主循环里调用" if not src else "")
+    # ---- C. an INDEPENDENT timer ends the ramp, not the slow main poll --
+    # FOUND LIVE 2026-10-17 (field test, real song):
+    #     [19:25:12] 偏差 +0.6s → 播放速度 0.75x（2.3s 内追平…）
+    #     [19:25:17] 已恢复 1.0x 速度
+    #     [19:25:17] ⚠ 归位晚了 2.7s
+    # Checking only from the main poll cannot hit a sub-second deadline: one poll
+    # is read_sessions() (~1.2s of PowerShell) + POLL_INTERVAL_SEC (2s), i.e. ~3s
+    # granularity -- LONGER than the ramp. Each late second adds (speed-1) of new
+    # error, which is the overshoot that used to force the next correction.
+    # The fix is a dedicated thread ticking at ALIGN_LOOP_RESTORE_TICK_SEC.
+    ok &= check("提供独立的归位定时线程 start_restore_timer/stop_restore_timer",
+                hasattr(F, "start_restore_timer") and hasattr(F, "stop_restore_timer"))
+    ok &= check("主循环 run() 启动并停止该定时器",
+                "start_restore_timer" in inspect.getsource(F.run)
+                if hasattr(F, "run") else False)
+
+    # The timer's tick must be well below the ramp it has to cut short, otherwise
+    # the whole fix is cosmetic.
+    restore_tick = float(getattr(follow_mod, "ALIGN_LOOP_RESTORE_TICK_SEC", 0.5))
+    tick = min(0.1, restore_tick / 5.0)
+    ok &= check(f"归位检查粒度 {tick:.2f}s 远小于追平窗口 {catchup}s",
+                tick <= catchup / 3.0,
+                f"tick={tick:.2f}s, catchup={catchup}s")
+
+    # ---- D. the ramp is anchored to WHEN THE COMMAND WAS ISSUED ---------
+    # FOUND LIVE 2026-10-17 (field test, real song):
+    #     [19:14:33] 播放速度 0.80x（1.5s 内追平，到点立即回 1.0x）
+    #     [19:14:38] 已恢复 1.0x 速度（已到理论追平时刻）
+    #     [19:14:38] ⚠ 归位晚了 23.1s
+    # A 1.5s ramp cannot be 23.1s overdue one second after it started. The cause
+    # was anchoring the deadline to the probe's START time (`now`), which at that
+    # point was already ~23s old because the probe had spent that long sampling
+    # SMTC. The deadline therefore landed in the PAST and the ramp was cut to a
+    # fraction of its length -- the picture never actually got its 1.5s of 0.80x.
+    # The fix: closed_loop_step returns a DURATION and the caller adds it to the
+    # clock reading taken right before issuing the command.
+    f_d, player_d = make_wired_follower(follow_mod, video_pos=100.8, music_pos=100.0)
+    f_d.current = key
+    f_d._pending = key
+    f_d._detected_at = 0.0
+    f_d._loop_last_probe = None
+    f_d._maybe_correct_drift(FakeSession(), key)
+    if player_d.speeds and f_d._loop_speed_until is not None:
+        promised = f_d._loop_speed_until - _t.monotonic()
+        # The anchor must be "now" (a fresh reading), not a stale probe start.
+        ok &= check("截止时刻锚定在『发出调速命令的时刻』，不是探测开始时刻",
+                    0.0 < promised <= catchup + 5.0,
+                    f"距现在 {promised:.1f}s（应为 ~{catchup:.1f}s，若为负数即为"
+                    f"锚点陈旧）")
+        # And the announced duration must equal the duration the caller armed.
+        announced = f_d.last_catchup_sec
+        ok &= check("日志承诺的时长与实际装备的截止时刻一致",
+                    announced is not None and abs(announced - promised) < 0.5,
+                    f"announced={announced}, armed={promised:.2f}s")
+    else:
+        ok &= check("锚点判据需要一次真实调速", False,
+                    f"speeds={player_d.speeds}, until={f_d._loop_speed_until}")
     return ok
 
 

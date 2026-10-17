@@ -342,6 +342,15 @@ class Follower:
         # track switches entirely.
         self._worker: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Dedicated timer that ends a speed ramp exactly on its deadline
+        # (issue #4). A thread, not a poll-time check, because `step()` is
+        # expensive: measured live 2026-10-17, one poll costs ~1.2s of SMTC
+        # reading plus POLL_INTERVAL_SEC of sleeping, so a restore that waited
+        # for the next poll fired 2.7s late -- the picture ran 0.25x too slow for
+        # 2.7 extra seconds and over-corrected by 0.68s. This thread only reads
+        # the clock and writes one property, so it can tick at 0.1s.
+        self._restore_stop = threading.Event()
+        self._restore_thread: threading.Thread | None = None
         self._pending: TrackKey | None = None
         # Monotonic timestamp of when the current song was detected (A5).
         self._detected_at: float | None = None
@@ -496,17 +505,20 @@ class Follower:
             "skip-anomaly"   residual too large to be drift -> reported, not acted on
             "speed"          target PLAYBACK SPEED (e.g. 1.20) for smooth drift
                              correction -- the caller sets mpv's speed property
-                             and MUST restore exactly 1.0x at `deadline`
-                             (monotonic seconds; None for actions that set no speed)
+                             and MUST restore exactly 1.0x once `catchup_sec`
+                             seconds have elapsed SINCE ISSUING THAT COMMAND
+                             (None for actions that set no speed)
             "resync"         confirmed genuine desync -> caller must seek
             "correct"        legacy absolute seek correction (kept for callers
                              that have not migrated to speed)
             "gave-up"        too many unusable samples; loop disabled for this song
 
-        `deadline` is issue #4's fix: because the speed law is fixed-TIME, the
-        instant the picture is expected to be exactly aligned is known in
-        advance, so the caller can restore 1.0x then instead of waiting for the
-        residual to be noticed inside the deadband ("必然快于或慢于 1").
+        `catchup_sec` is issue #4's fix: because the speed law is fixed-TIME, the
+        ramp length is known when it starts, so the caller can restore 1.0x the
+        moment it is over instead of waiting for the residual to be noticed
+        inside the deadband ("必然快于或慢于 1"). It is a DURATION, not an
+        instant, because this function's `now` is captured before several
+        seconds of measurement -- see the comment where it is returned.
 
         WHY THIS IS A SEPARATE METHOD: the decision rules are the part worth
         testing, and they must be testable WITHOUT a real player or a real
@@ -653,7 +665,16 @@ class Follower:
         # restore 1.0x with an error still on the clock -- the very "必然再次
         # 出现偏移" the user reported, only smaller.
         realised_sec = abs(residual) / abs(clamped)
-        deadline = now + realised_sec
+        # RETURN THE DURATION, NOT AN ABSOLUTE INSTANT (measured live 2026-10-17).
+        # `now` is captured when the probe STARTS, but the probe then spends
+        # seconds reading SMTC (3 samples x ~1.2s) and the video position, so by
+        # the time the caller writes the speed, `now` is already stale by that
+        # much. Returning `now + realised_sec` made the deadline land in the PAST
+        # and the ramp was cut short -- the live log showed
+        #     [19:14:33] 播放速度 0.80x（1.5s 内追平…）
+        #     [19:14:38] ⚠ 归位晚了 23.1s
+        # i.e. a 1.5s ramp that could never have run 1.5s. The caller now anchors
+        # the duration to the instant it actually issued the command.
         # Expose the achieved ramp to the caller (and to the log) so the user can
         # see the promise being kept: speed, error, and the moment of 1.0x.
         self.last_catchup_sec = realised_sec
@@ -670,7 +691,7 @@ class Follower:
         self.last_loop_applied = speed
         self._loop_applied_count += 1
         self._loop_strikes = 0
-        return ("speed", speed, deadline)
+        return ("speed", speed, realised_sec)
 
     def _age_video_position(self, raw_position: float | None,
                             read_at: float, now: float,
@@ -707,15 +728,20 @@ class Follower:
             return None
         return raw_position + age
 
-    def _restore_speed(self, why: str) -> None:
-        """Put the playback speed back to exactly 1.0x and report it."""
+    def _restore_speed_locked(self, why: str) -> None:
+        """Put the playback speed back to 1.0x. Caller must hold `self._lock`."""
         self.player.set_property("speed", "1.0")
         self._loop_speed_applied = None
         self._loop_speed_until = None
         self.log(f"    · 已恢复 1.0x 速度（{why}）")
 
+    def _restore_speed(self, why: str) -> None:
+        """Put the playback speed back to exactly 1.0x and report it."""
+        with self._lock:
+            self._restore_speed_locked(why)
+
     def restore_speed_if_due(self, key: TrackKey | None = None) -> bool:
-        """End an in-flight speed ramp AT its deadline. Call on every poll.
+        """End an in-flight speed ramp the moment its deadline passes.
 
         WHY THIS EXISTS (issue #4, user 2026-10-10): "现状是每次设置完速度后，
         必然快于或慢于 1，导致一段时间之后必然再次出现偏移。应当让修改后在达到
@@ -730,34 +756,77 @@ class Follower:
 
         Because the speed law is fixed-TIME (see ALIGN_LOOP_CATCHUP_SEC), the
         moment of alignment is known when the ramp starts, so this check needs
-        no measurement at all -- it only reads the clock, which makes it cheap
-        enough to call on every poll (POLL_INTERVAL_SEC) instead of once per
-        probe period.
+        no measurement at all -- only the clock. That is what lets
+        `_restore_loop()` tick it at ALIGN_LOOP_RESTORE_TICK_SEC instead of
+        waiting for the (slow) main poll.
+
+        Thread-safe: the ramp state and the speed write are done under `_lock`,
+        so this can race the main loop's "start a ramp" path without either
+        clobbering the other (measured hazard: a ramp set to 0.75 while the
+        timer still believed the previous ramp was live).
 
         Returns True when a speed was actually restored this call.
         """
-        if self._loop_speed_applied is None:
-            return False
-        # A different song is now on screen: the ramp belonged to the old one.
-        # Drop the state WITHOUT writing to the player -- the new song's window
-        # is started fresh at 1.0x by _reset_loop_state / play_url.
-        if key is not None and self._loop_key is not None and key != self._loop_key:
-            self._loop_speed_applied = None
-            self._loop_speed_until = None
-            return False
-        deadline = self._loop_speed_until
-        if deadline is not None and time.monotonic() < deadline:
-            return False
-        overdue = 0.0 if deadline is None else time.monotonic() - deadline
-        self._restore_speed(
-            "已到理论追平时刻" if deadline is not None else "追平截止时刻丢失")
-        if deadline is not None and overdue > ALIGN_LOOP_RESTORE_TICK_SEC:
-            # The caller polled too slowly to end the ramp on time. Worth saying
-            # out loud: it means the promise "到点立即回到 1.0x" is being missed
-            # by the poll rate, not by the ramp itself.
-            self.log(f"    · ⚠ 归位晚了 {overdue:.1f}s（轮询跟不上 "
-                     f"{ALIGN_LOOP_RESTORE_TICK_SEC}s 的检查粒度）")
-        return True
+        with self._lock:
+            if self._loop_speed_applied is None:
+                return False
+            # A different song is now on screen: the ramp belonged to the old
+            # one. Drop the state WITHOUT writing to the player -- the new song's
+            # window is started fresh at 1.0x by _reset_loop_state / play_url.
+            if key is not None and self._loop_key is not None and key != self._loop_key:
+                self._loop_speed_applied = None
+                self._loop_speed_until = None
+                return False
+            deadline = self._loop_speed_until
+            if deadline is not None and time.monotonic() < deadline:
+                return False
+            overdue = 0.0 if deadline is None else time.monotonic() - deadline
+            self._restore_speed_locked(
+                "已到理论追平时刻" if deadline is not None else "追平截止时刻丢失")
+            if deadline is not None and overdue > ALIGN_LOOP_RESTORE_TICK_SEC:
+                # The timer ticked late: the promise "到点立即回到 1.0x" is being
+                # missed by the tick rate, not by the ramp itself.
+                self.log(f"    · ⚠ 归位晚了 {overdue:.1f}s（检查粒度 "
+                         f"{ALIGN_LOOP_RESTORE_TICK_SEC}s）")
+            return True
+
+    def start_restore_timer(self) -> None:
+        """Start the thread that ends speed ramps on time (issue #4)."""
+        if self._restore_thread and self._restore_thread.is_alive():
+            return
+        self._restore_stop.clear()
+        self._restore_thread = threading.Thread(
+            target=self._restore_loop, name="mvm-speed-restore", daemon=True)
+        self._restore_thread.start()
+
+    def stop_restore_timer(self) -> None:
+        self._restore_stop.set()
+        th = self._restore_thread
+        if th and th.is_alive():
+            th.join(timeout=3)
+
+    def _restore_loop(self) -> None:
+        """Tick `restore_speed_if_due` at ALIGN_LOOP_RESTORE_TICK_SEC.
+
+        MEASURED WHY A THREAD IS NEEDED (live run, 2026-10-17):
+            [19:25:12] 偏差 +0.6s → 播放速度 0.75x（2.3s 内追平…）
+            [19:25:17] 已恢复 1.0x 速度
+            [19:25:17] ⚠ 归位晚了 2.7s
+        Checking from the main poll cannot hit a sub-second deadline: one poll
+        is read_sessions() (~1.2s of PowerShell) plus POLL_INTERVAL_SEC (2s), so
+        the granularity is ~3s -- longer than the ramp the user asked for. The
+        late restore adds (speed-1)*delay seconds of error, which is exactly the
+        overshoot that used to force the next correction.
+
+        This thread does no I/O other than the single property write, so a 0.1s
+        tick costs nothing measurable.
+        """
+        tick = min(0.1, ALIGN_LOOP_RESTORE_TICK_SEC / 5.0)
+        while not self._restore_stop.wait(tick):
+            try:
+                self.restore_speed_if_due()
+            except Exception as exc:  # noqa: BLE001 - a timer must never kill
+                self.log(f"    · ⚠ 归位检查异常（{exc}），继续运行")
 
     def _maybe_correct_drift(self, session: NowPlaying, key: TrackKey) -> None:
         """The periodic closed-loop probe. Safe to call on every poll.
@@ -849,7 +918,7 @@ class Follower:
         self._loop_unusable_streak = 0
 
         assert video_pos is not None
-        action, correction, speed_deadline = self.closed_loop_step(
+        action, correction, catchup_sec = self.closed_loop_step(
             key, music_position=music_pos, video_position=video_pos,
             usable=True, now=now,
         )
@@ -908,22 +977,30 @@ class Follower:
         if action == "speed":
             # Fixed-time drift correction: ramp the playback speed instead of
             # seeking. `correction` here is the target SPEED (e.g. 1.20) and
-            # `speed_deadline` is the moment that ramp is expected to land the
-            # picture exactly on the music.
+            # `catchup_sec` is how long that ramp needs to land the picture
+            # exactly on the music.
+            #
+            # The whole "check ownership -> write speed -> arm the deadline" block
+            # runs under _lock so the restore timer (which holds the same lock)
+            # can never observe a half-installed ramp, e.g. see the OLD deadline
+            # while the new speed is already applied and immediately undo it.
             with self._lock:
                 if self._pending != key or self.current != key:
                     return
-            speed = float(correction)
-            if not self.player.set_property("speed", f"{speed:.4f}"):
-                # The command file was not written (mpv gone / channel down).
-                # Do NOT arm a deadline for a speed that never took effect --
-                # that would "restore" 1.0x later and log a lie.
-                self.log(f"  · 闭环校验：偏差 {self.last_loop_error:+.1f}s"
-                         f" → 调速命令发送失败，本周期不调")
-                return
-            self._loop_speed_applied = speed
-            self._loop_speed_until = speed_deadline
-            catchup = self.last_catchup_sec or 0.0
+                speed = float(correction)
+                catchup = float(catchup_sec or 0.0)
+                # Anchor the ramp to the instant the command is ISSUED, not to
+                # the instant this probe began: everything above took seconds.
+                issued_at = time.monotonic()
+                if not self.player.set_property("speed", f"{speed:.4f}"):
+                    # The command file was not written (mpv gone / channel down).
+                    # Do NOT arm a deadline for a speed that never took effect --
+                    # that would "restore" 1.0x later and log a lie.
+                    self.log(f"  · 闭环校验：偏差 {self.last_loop_error:+.1f}s"
+                             f" → 调速命令发送失败，本周期不调")
+                    return
+                self._loop_speed_applied = speed
+                self._loop_speed_until = issued_at + catchup
             self.log(f"  · 闭环校验：偏差 {self.last_loop_error:+.1f}s"
                      f" → 播放速度 {speed:.2f}x（{catchup:.1f}s 内追平，到点立即回 1.0x）")
             return
@@ -2031,6 +2108,9 @@ class Follower:
         if killed:
             self.log(f"· 清理了 {killed} 个残留视频窗口")
         started = time.time()
+        # issue #4: the speed ramp must end on its deadline, and the main poll is
+        # far too coarse (~1.2s SMTC read + POLL_INTERVAL_SEC) to time that.
+        self.start_restore_timer()
         try:
             while True:
                 self.step()
@@ -2040,6 +2120,7 @@ class Follower:
         except KeyboardInterrupt:
             self.log("收到中断")
         finally:
+            self.stop_restore_timer()
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=15)
             self.player.stop()
